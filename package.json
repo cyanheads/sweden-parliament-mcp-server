@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/sweden-parliament-mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "mcpName": "io.github.cyanheads/sweden-parliament-mcp-server",
   "description": "Search Swedish parliamentary documents, speeches, votes, members, and statutes via MCP. STDIO or Streamable HTTP.",
   "type": "module",
