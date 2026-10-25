@@ -1,0 +1,25 @@
+{
+  "name": "sweden-parliament-mcp-server",
+  "version": "0.1.0",
+  "description": "Search Swedish parliamentary documents, speeches, votes, members, and statutes via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/sweden-parliament-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/sweden-parliament-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "ai-tools", "typescript", "cyanheads", "sweden", "riksdag", "parliament", "legislation", "statutes", "voting"],
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "sweden-parliament-mcp-server",
+    "shortDescription": "Search Swedish parliamentary documents, speeches, votes, members, and statutes via MCP. STDIO or Streamable HTTP.",
+    "longDescription": "Search Swedish parliamentary documents, speeches, votes, members, and statutes via MCP. STDIO or Streamable HTTP.",
+    "developerName": "cyanheads",
+    "category": "research",
+    "capabilities": ["Read"],
+    "websiteURL": "https://github.com/cyanheads/sweden-parliament-mcp-server",
+    "defaultPrompt": []
+  }
+}

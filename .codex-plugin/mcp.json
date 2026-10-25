@@ -1,0 +1,9 @@
+{
+  "sweden-parliament-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "@cyanheads/sweden-parliament-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}
