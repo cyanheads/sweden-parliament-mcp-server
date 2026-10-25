@@ -18,11 +18,9 @@ const assignmentWire = z.object({
   typ: s,
   from: s,
   tom: s,
-  uppgift: collectionOf(z.union([z.string(), z.object({}).strict()]))
-    .optional()
-    .transform((values) =>
-      (values ?? []).filter((value): value is string => typeof value === 'string'),
-    ),
+  uppgift: collectionOf(z.union([z.string(), z.object({}).strict()])).transform((values) =>
+    values.filter((value): value is string => typeof value === 'string'),
+  ),
   intressent_id: s,
 });
 const memberWire = z.object({
@@ -36,18 +34,14 @@ const memberWire = z.object({
   person_url_xml: s,
   personuppdrag: z
     .object({
-      uppdrag: collectionOf(assignmentWire)
-        .optional()
-        .transform((rows) => rows ?? []),
+      uppdrag: collectionOf(assignmentWire),
     })
     .nullish(),
 });
 const registerWire = z.object({
   personlista: z.object({
     '@hits': wireCount,
-    person: collectionOf(memberWire)
-      .optional()
-      .transform((rows) => rows ?? []),
+    person: collectionOf(memberWire),
   }),
 });
 

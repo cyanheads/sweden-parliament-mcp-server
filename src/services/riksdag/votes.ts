@@ -42,9 +42,7 @@ const memberList = z.object({
     '@villkor': s,
     '@q': s,
     '@varning': s,
-    votering: collectionOf(memberWire)
-      .optional()
-      .transform((rows) => rows ?? []),
+    votering: collectionOf(memberWire),
   }),
 });
 const groupedWire = z
@@ -56,9 +54,7 @@ const groupedList = z.object({
     '@villkor': s,
     '@q': s,
     '@varning': s,
-    votering: collectionOf(groupedWire)
-      .optional()
-      .transform((rows) => rows ?? []),
+    votering: collectionOf(groupedWire),
   }),
 });
 

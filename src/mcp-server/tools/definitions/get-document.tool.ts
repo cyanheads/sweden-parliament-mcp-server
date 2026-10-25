@@ -49,7 +49,7 @@ const inputSchema = z.object({
   documentId: z
     .string()
     .min(1)
-    .describe('Canonical document ID or unambiguous SFS YYYY:N identifier.'),
+    .describe('Document ID from riksdag_search_documents, or unambiguous SFS YYYY:N identifier.'),
   sections: z
     .array(z.string())
     .optional()
@@ -220,7 +220,7 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
       code: JsonRpcErrorCode.SerializationError,
       when: 'The status response contradicts the requested document ID.',
       recovery:
-        'Retry the same tool with an identifier copied from riksdag_search_documents, riksdag_search_speeches or riksdag_search_members; report repeated mismatches.',
+        'Copy documentId from riksdag_search_documents and retry riksdag_get_document; report repeated mismatches with the request identifier.',
       thrownBy: 'service',
     },
     {
@@ -235,7 +235,7 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The source remains unavailable after retries.',
       recovery:
-        'Retry the same tool later; narrow riksdag_search_documents or riksdag_search_speeches with session filters.',
+        'Retry riksdag_get_document with the same documentId after the source becomes available.',
       thrownBy: 'service',
     },
     {
@@ -365,6 +365,7 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
       output.textRepresentation = record.textRepresentation;
       if (record.text !== undefined) {
         const text = record.text;
+        const textTotalLength = codePointLength(text);
         Object.assign(
           output,
           fitText({
@@ -374,12 +375,12 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
             enrichment,
             budget,
             build: (page, returnedLength) => {
-              const textHasMore = input.textOffset + returnedLength < codePointLength(text);
+              const textHasMore = input.textOffset + returnedLength < textTotalLength;
               return {
                 ...output,
                 text: page,
                 textOffset: input.textOffset,
-                textTotalLength: codePointLength(text),
+                textTotalLength,
                 textReturnedLength: returnedLength,
                 textHasMore,
                 ...(textHasMore
@@ -398,7 +399,7 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
             },
           }),
         );
-        if (input.textOffset > codePointLength(text))
+        if (input.textOffset > textTotalLength)
           enrichment.notices.push(
             'Text offset is beyond the published body; this is an empty terminal page.',
           );
@@ -406,6 +407,7 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
     }
     if (selected.includes('source_html') && record.sourceHtml !== undefined) {
       const html = record.sourceHtml;
+      const htmlTotalLength = codePointLength(html);
       Object.assign(
         output,
         fitText({
@@ -415,12 +417,12 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
           enrichment,
           budget,
           build: (page, returnedLength) => {
-            const htmlHasMore = input.htmlOffset + returnedLength < codePointLength(html);
+            const htmlHasMore = input.htmlOffset + returnedLength < htmlTotalLength;
             return {
               ...output,
               sourceHtml: page,
               htmlOffset: input.htmlOffset,
-              htmlTotalLength: codePointLength(html),
+              htmlTotalLength,
               htmlReturnedLength: returnedLength,
               htmlHasMore,
               ...(htmlHasMore
@@ -439,7 +441,7 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
           },
         }),
       );
-      if (input.htmlOffset > codePointLength(html))
+      if (input.htmlOffset > htmlTotalLength)
         enrichment.notices.push(
           'HTML offset is beyond the published source; this is an empty terminal page.',
         );

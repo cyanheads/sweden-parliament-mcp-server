@@ -43,7 +43,7 @@ const inputSchema = z.object({
   session: z.string().min(1).describe('Required parliamentary session, for example 2024/25.'),
   report: optionalText.describe('Report designation or session:designation; report mode only.'),
   documentId: optionalText.describe(
-    'Exact report document ID; report mode alternative to report designation.',
+    'Report mode: documentId from riksdag_search_documents with documentType bet; alternative to report.',
   ),
   point: z
     .number()
@@ -52,7 +52,7 @@ const inputSchema = z.object({
     .optional()
     .describe('One authoritative report point; omit to traverse all points.'),
   memberId: optionalText.describe(
-    'Required numeric member ID in member mode, including leading zeros.',
+    'Required in member mode: numeric memberId from riksdag_search_members, including leading zeros.',
   ),
   party: optionalText.describe(
     'Member-mode local party filter; report party groups are always complete.',
@@ -206,7 +206,7 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
       code: JsonRpcErrorCode.SerializationError,
       when: 'Source identities contradict the required selection.',
       recovery:
-        'Retry the same tool with an identifier copied from riksdag_search_documents, riksdag_search_speeches or riksdag_search_members; report repeated mismatches.',
+        'Resolve report documentId with riksdag_search_documents or memberId with riksdag_search_members, then retry the matching mode; report repeated mismatches with the request identifier.',
       thrownBy: 'service',
     },
     {
@@ -221,7 +221,7 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Network or source failure remains after retries.',
       recovery:
-        'Retry the same tool later; narrow riksdag_search_documents or riksdag_search_speeches with session filters.',
+        'Retry riksdag_get_votes with the same report or member selection after the source becomes available.',
       thrownBy: 'service',
     },
     {
@@ -236,7 +236,7 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'Complete-list or grouped-count boundary is reached.',
       recovery:
-        'Retry riksdag_search_speeches with memberId, party or speechType, or riksdag_get_votes in member mode with party; if no narrower scope is available, this source cannot provide complete traversal for that selection.',
+        'In member mode, retry riksdag_get_votes with a party filter. A saturated report-point party group has no narrower complete traversal on this source.',
       thrownBy: 'service',
     },
   ],

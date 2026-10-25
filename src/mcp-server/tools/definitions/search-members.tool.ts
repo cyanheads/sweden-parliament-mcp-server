@@ -94,7 +94,7 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
       code: JsonRpcErrorCode.SerializationError,
       when: 'Detail identity or filter rows contradict required identity.',
       recovery:
-        'Retry the same tool with an identifier copied from riksdag_search_documents, riksdag_search_speeches or riksdag_search_members; report repeated mismatches.',
+        'Check party and constituency with riksdag_list_reference and retry riksdag_search_members; report repeated mismatches with the request identifier.',
       thrownBy: 'service',
     },
     {
@@ -109,7 +109,7 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Network or service error after retries.',
       recovery:
-        'Retry the same tool later; narrow riksdag_search_documents or riksdag_search_speeches with session filters.',
+        'Retry riksdag_search_members with the same filters after the source becomes available.',
       thrownBy: 'service',
     },
     {

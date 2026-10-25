@@ -87,7 +87,7 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
       code: JsonRpcErrorCode.SerializationError,
       when: 'Source rows contradict required filter identities.',
       recovery:
-        'Retry the same tool with an identifier copied from riksdag_search_documents, riksdag_search_speeches or riksdag_search_members; report repeated mismatches.',
+        'Check document type, session and committee with riksdag_list_reference and retry riksdag_search_documents; report repeated mismatches with the request identifier.',
       thrownBy: 'service',
     },
     {
@@ -102,7 +102,7 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The source remains unavailable after retries.',
       recovery:
-        'Retry the same tool later; narrow riksdag_search_documents or riksdag_search_speeches with session filters.',
+        'Retry riksdag_search_documents after the source becomes available; add session or documentType to narrow a slow query.',
       thrownBy: 'service',
     },
     {

@@ -19,7 +19,7 @@ const argsSchema = z.object({
   memberId: z
     .string()
     .min(1)
-    .describe('Numeric member IID copied from search, including leading zeros.'),
+    .describe('Numeric memberId from riksdag_search_members, including leading zeros.'),
   assignmentOffset: z
     .number()
     .int()
@@ -102,7 +102,7 @@ export const riksdagGetMember = tool('riksdag_get_member', {
       code: JsonRpcErrorCode.SerializationError,
       when: 'Detail identity or filter rows contradict required identity.',
       recovery:
-        'Retry the same tool with an identifier copied from riksdag_search_documents, riksdag_search_speeches or riksdag_search_members; report repeated mismatches.',
+        'Copy memberId from riksdag_search_members and retry riksdag_get_member; report repeated mismatches with the request identifier.',
       thrownBy: 'service',
     },
     {
@@ -117,7 +117,7 @@ export const riksdagGetMember = tool('riksdag_get_member', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Network or service error after retries.',
       recovery:
-        'Retry the same tool later; narrow riksdag_search_documents or riksdag_search_speeches with session filters.',
+        'Retry riksdag_get_member with the same memberId after the source becomes available.',
       thrownBy: 'service',
     },
     {

@@ -37,9 +37,7 @@ const wireSpeech = z.object({
 const listSchema = z.object({
   anforandelista: z.object({
     '@antal': wireCount,
-    anforande: collectionOf(wireSpeech)
-      .optional()
-      .transform((rows) => rows ?? []),
+    anforande: collectionOf(wireSpeech),
   }),
 });
 const detailSchema = z.object({ anforande: wireSpeech });

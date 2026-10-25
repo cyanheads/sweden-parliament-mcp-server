@@ -45,7 +45,9 @@ const argsSchema = z.object({
   memberId: z
     .string()
     .optional()
-    .describe('Search only: numeric speaker IID, retaining leading zeros.'),
+    .describe(
+      'Search only: numeric memberId from riksdag_search_members, retaining leading zeros.',
+    ),
   party: z
     .string()
     .optional()
@@ -67,7 +69,7 @@ const argsSchema = z.object({
     .min(0)
     .optional()
     .describe(
-      'Search only: sequential detail hydrations, default 1 and applied maximum 5; 0 returns metadata.',
+      'Search only: maximum speeches to request text for, default 1 and applied maximum 5; 0 returns metadata.',
     ),
   speechId: z
     .string()
@@ -255,7 +257,7 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
     textCount: z
       .number()
       .optional()
-      .describe('Applied maximum number of sequential detail hydrations.'),
+      .describe('Applied maximum speeches selected for text retrieval.'),
     hasMore: z.boolean().optional().describe('Whether filtered speech rows remain.'),
     truncated: z
       .boolean()
@@ -299,7 +301,7 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
       code: JsonRpcErrorCode.SerializationError,
       when: 'Detail identity/filter rows contradict required identity.',
       recovery:
-        'Retry the same tool with an identifier copied from riksdag_search_documents, riksdag_search_speeches or riksdag_search_members; report repeated mismatches.',
+        'Check memberId with riksdag_search_members or copy speechId from riksdag_search_speeches search mode, then retry; report repeated mismatches with the request identifier.',
       thrownBy: 'service',
     },
     {
@@ -314,7 +316,7 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Network/5xx or HTML error page after retries.',
       recovery:
-        'Retry the same tool later; narrow riksdag_search_documents or riksdag_search_speeches with session filters.',
+        'Retry riksdag_search_speeches after the source becomes available; narrow search mode with memberId, party or speechType.',
       thrownBy: 'service',
     },
     {
@@ -329,7 +331,7 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'Complete-list safety boundary reached.',
       recovery:
-        'Retry riksdag_search_speeches with memberId, party or speechType, or riksdag_get_votes in member mode with party; if no narrower scope is available, this source cannot provide complete traversal for that selection.',
+        'Retry riksdag_search_speeches with memberId, party or speechType; if no narrower scope is available, this source cannot provide complete traversal for that selection.',
       thrownBy: 'service',
     },
   ],
