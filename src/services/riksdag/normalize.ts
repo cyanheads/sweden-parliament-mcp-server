@@ -59,10 +59,10 @@ export function normalizeSession(value: string): string {
 
 /** Canonicalize an ordinary document ID or the three supported unambiguous SFS aliases. */
 export function normalizeDocumentId(value: string): string {
-  const id = value.trim();
+  const id = value.trim().normalize('NFC');
   const sfs = /^(?:sfs-([1-9]\d{3})-([1-9]\d*)|(?:sfs\s+)?([1-9]\d{3}):([1-9]\d*))$/i.exec(id);
   if (sfs) return `sfs-${sfs[1] ?? sfs[3]}-${sfs[2] ?? sfs[4]}`;
-  if (!/^[a-z][a-z0-9]{3,}$/i.test(id)) return invalid('documentId');
+  if (!/^[a-zåäö][a-zåäö0-9]{3,}$/iu.test(id)) return invalid('documentId');
   return id.toUpperCase();
 }
 
