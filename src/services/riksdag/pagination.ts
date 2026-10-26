@@ -3,7 +3,6 @@
  * @module services/riksdag/pagination
  */
 import { measureResponse, type SuccessEnrichment } from './output.js';
-import { codePointLength, sliceCodePoints } from './text.js';
 import type { ToolBudget } from './transport.js';
 
 /** Default response target across both surfaces; indivisible entries may exceed it. */
@@ -34,12 +33,10 @@ export function fitRows<T, R>(options: {
       result = build(selected, selected.length, truncated);
     } while (selected.length > 1 && measureResponse(result, enrichment) > RESPONSE_TARGET_BYTES);
   }
-  if (measureResponse(result, enrichment) > RESPONSE_TARGET_BYTES) {
+  if (measureResponse(result, enrichment) > RESPONSE_TARGET_BYTES)
     enrichment.notices.push(
       'An indivisible entry exceeds the default response target and is returned intact; continuation advances after that entry.',
     );
-    result = build(selected, truncated ? selected.length : limit, truncated);
-  }
   budget?.check();
   return result;
 }
@@ -53,44 +50,115 @@ export function fitText<R>(options: {
   enrichment: SuccessEnrichment;
   budget?: ToolBudget;
 }): R {
-  const { text, offset, length, build, enrichment, budget } = options;
+  const source = {
+    text: options.text,
+    offset: options.offset,
+    ...(options.length === undefined ? {} : { length: options.length }),
+  };
+  const prepared = prepareTextSource(source, options.enrichment, options.budget);
+  return fitTextResponse({
+    hasDefault: source.length === undefined && prepared.requested > 0,
+    hasExplicit: source.length !== undefined,
+    enrichment: options.enrichment,
+    candidate: (cap) => {
+      options.budget?.check();
+      const page = textPage(prepared, cap);
+      return options.build(page.text, page.returnedLength);
+    },
+  });
+}
+
+/** One independently continued representation in a combined response. */
+export interface TextPageSource {
+  length?: number;
+  offset: number;
+  pastEndNotice?: string;
+  text: string;
+}
+
+/** Fits all default text channels against the final envelope while retaining explicit lengths. */
+export function fitTextPages<S extends TextPageSource, R>(options: {
+  sources: readonly S[];
+  build: (pages: { source: S; text: string; returnedLength: number; totalLength: number }[]) => R;
+  enrichment: SuccessEnrichment;
+  budget?: ToolBudget;
+}): R {
+  const { sources, build, enrichment, budget } = options;
+  const prepared = sources.map((source) => prepareTextSource(source, enrichment, budget));
+  const candidate = (cap: number) => {
+    budget?.check();
+    return build(prepared.map((entry) => textPage(entry, cap)));
+  };
+  return fitTextResponse({
+    candidate,
+    enrichment,
+    hasDefault: prepared.some(
+      ({ source, requested }) => source.length === undefined && requested > 0,
+    ),
+    hasExplicit: sources.some((source) => source.length !== undefined),
+  });
+}
+
+function prepareTextSource<S extends TextPageSource>(
+  source: S,
+  enrichment: SuccessEnrichment,
+  budget: ToolBudget | undefined,
+) {
   budget?.check();
-  const total = codePointLength(text);
-  if (offset > total)
+  const codePoints = Array.from(source.text);
+  const remaining = codePoints.length - source.offset;
+  if (remaining < 0)
     enrichment.notices.push(
-      'The text offset is beyond the available text; this is an empty terminal page.',
+      source.pastEndNotice ??
+        'The text offset is beyond the available text; this is an empty terminal page.',
     );
-  const requested = Math.min(length ?? 1000, Math.max(0, total - offset));
-  let result = build(sliceCodePoints(text, offset, requested), requested);
-  if (measureResponse(result, enrichment) <= RESPONSE_TARGET_BYTES) {
-    budget?.check();
-    return result;
-  }
-  if (length !== undefined) {
+  return { source, codePoints, requested: Math.min(source.length ?? 8000, Math.max(0, remaining)) };
+}
+
+function textPage<S extends TextPageSource>(
+  entry: ReturnType<typeof prepareTextSource<S>>,
+  cap: number,
+) {
+  const { source, codePoints, requested } = entry;
+  const returnedLength = source.length === undefined ? Math.min(requested, cap) : requested;
+  return {
+    source,
+    text: codePoints.slice(source.offset, source.offset + returnedLength).join(''),
+    returnedLength,
+    totalLength: codePoints.length,
+  };
+}
+
+function fitTextResponse<R>({
+  candidate,
+  enrichment,
+  hasDefault,
+  hasExplicit,
+}: {
+  candidate: (cap: number) => R;
+  enrichment: SuccessEnrichment;
+  hasDefault: boolean;
+  hasExplicit: boolean;
+}): R {
+  const full = candidate(8000);
+  if (measureResponse(full, enrichment) <= RESPONSE_TARGET_BYTES) return full;
+  if (hasDefault)
     enrichment.notices.push(
-      'The explicit textLength is honored and this response exceeds the default response target.',
+      'Default text pages were shortened to fit the response target; follow each complete text continuation without text loss.',
     );
-    result = build(sliceCodePoints(text, offset, requested), requested);
-    budget?.check();
-    return result;
-  }
-  enrichment.notices.push(
-    'The default text page was shortened to fit the response target; follow nextTextCall to continue without text loss.',
-  );
-  let low = requested === 0 ? 0 : 1;
-  let high = requested;
-  while (low < high) {
-    budget?.check();
+  let low = 1;
+  let high = 8000;
+  while (hasDefault && low < high) {
     const middle = Math.ceil((low + high) / 2);
-    const candidate = build(sliceCodePoints(text, offset, middle), middle);
-    if (measureResponse(candidate, enrichment) <= RESPONSE_TARGET_BYTES) low = middle;
+    if (measureResponse(candidate(middle), enrichment) <= RESPONSE_TARGET_BYTES) low = middle;
     else high = middle - 1;
   }
-  result = build(sliceCodePoints(text, offset, low), low);
+  const result = candidate(hasDefault ? low : 8000);
   if (measureResponse(result, enrichment) > RESPONSE_TARGET_BYTES)
     enrichment.notices.push(
-      'The non-text metadata exceeds the default response target and is returned intact.',
+      hasExplicit
+        ? 'The explicit textLength or htmlLength is honored and this response exceeds the default response target.'
+        : 'The non-text metadata exceeds the default response target and is returned intact.',
     );
-  budget?.check();
   return result;
 }

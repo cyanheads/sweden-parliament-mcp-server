@@ -11,7 +11,7 @@
   "homepage": "https://github.com/cyanheads/sweden-parliament-mcp-server#readme",
   "repository": "https://github.com/cyanheads/sweden-parliament-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "ai-tools", "typescript", "bun", "stdio", "streamable-http", "cyanheads", "sweden", "riksdag", "parliament", "legislation", "statutes", "voting"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "ai-tools", "typescript", "bun", "stdio", "streamable-http", "cyanheads", "sweden", "riksdag", "parliament", "legislation", "statutes", "voting", "sfs", "open-data"],
   "mcpServers": {
     "sweden-parliament-mcp-server": {
       "command": "npx",

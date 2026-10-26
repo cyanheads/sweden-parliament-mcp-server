@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/sweden-parliament-mcp-server</h1>
   <p><b>Search Swedish parliamentary documents, speeches, votes, members, and statutes via MCP. STDIO or Streamable HTTP.</b>
-  <div>7 Tools • 0 Resources • 0 Prompts</div>
+  <div>7 Tools</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/sweden-parliament-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/sweden-parliament-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/sweden-parliament-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/sweden-parliament-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/sweden-parliament-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/sweden-parliament-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -19,11 +19,17 @@
 
 </div>
 
+<div align="center">
+
+**Public Hosted Server:** [https://sweden-parliament.caseyjhand.com/mcp](https://sweden-parliament.caseyjhand.com/mcp)
+
+</div>
+
 ---
 
 ## Overview
 
-Swedish parliamentary records from [Riksdagen Open Data](https://www.riksdagen.se/sv/dokument-och-lagar/riksdagens-oppna-data/). Find proposals and committee reports, follow published decisions and main votes, read speeches, explore member assignments, and retrieve consolidated SFS statutes. Runs as a stdio process or a local Streamable HTTP server; no API key required.
+Swedish parliamentary records from [Riksdagen Open Data](https://www.riksdagen.se/sv/dokument-och-lagar/riksdagens-oppna-data/). Find proposals and committee reports, follow published decisions and main votes, read speeches, explore member assignments, and retrieve consolidated SFS statutes. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above; no API key required.
 
 Source: The Swedish Parliament. This independent service is not operated or endorsed by Sveriges riksdag. Swedish titles, labels, decisions, and text retain their source wording; English labels appear only where the source supplies them.
 
@@ -32,10 +38,10 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 | Tool | Description |
 |:---|:---|
 | `riksdag_list_reference` | Browse official document types, committees, parties, constituencies, sessions, and identifier and coverage guidance |
-| `riksdag_search_documents` | Search parliamentary documents and consolidated SFS statutes by words, type, session, committee, party, or dates |
+| `riksdag_search_documents` | Search parliamentary documents and consolidated SFS statutes by words, type, session, committee, party, member, or dates |
 | `riksdag_get_document` | Read publication metadata, decisions, reservations, activities, links, and paginated text |
 | `riksdag_search_speeches` | Find speeches within a session by debate heading, member, or party; retrieve full text through get mode |
-| `riksdag_get_votes` | Read report decisions with party main-vote totals or one member's session main votes |
+| `riksdag_get_votes` | Read report decisions, party main-vote totals, individual ballots for a point, or one member's session main votes |
 | `riksdag_search_members` | Find register entries by name, party, constituency, and source service classification |
 | `riksdag_get_member` | Read an exact member IID and its published assignment history |
 
@@ -44,62 +50,62 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 ### `riksdag_list_reference` <sub>tool</sub>
 
 - `topic`: `document_types`, `committees`, `parties`, `constituencies`, `speech_types`, `sessions`, `identifiers`, or `coverage`
-- Dated offline snapshot with Swedish labels, available source English labels, source links, and `referenceVerifiedAt`; document subtypes remain separate from parent codes, and the session catalog can lag current sessions
-- `offset` pagination; `limit` defaults to 20 and is clamped to 100, with `totalCount` and complete `nextCall` arguments
+- Dated offline snapshot (`referenceVerifiedAt`) with Swedish labels and source-supplied English labels; the session catalog can lag current sessions, and newer well-formed sessions are still accepted
+- Sessions accept `YYYY/YY`, consecutive `YYYY/YYYY`, or a historical calendar year; `1999/00` retains the published `1999/2000` form
+- `offset` pagination; `limit` defaults to 20, clamped to 100, with `totalCount` and `nextCall`
 
 ---
 
 ### `riksdag_search_documents` <sub>tool</sub>
 
-- Optional `query`, `documentType`, `session`, `committee`, `party`, `dateFrom`, and `dateTo`; dates use `YYYY-MM-DD`, and codes or exact reference labels are accepted
-- Remote `page` starts at 1; `pageSize` defaults to 10 and is clamped to 50. Every fetched row is returned, with source ordering, available `totalCount`, and `nextCall`
+- Optional `query`, `documentType`, `session`, `committee`, `party`, `memberId`, `dateFrom`, and `dateTo`; dates use `YYYY-MM-DD`, and codes or exact reference labels are accepted. `memberId` selects source-linked participants, without inferring authorship
+- `sort` is `relevance` for a nonblank query and `date` otherwise; either can be selected explicitly. Source subtitles include available author and SFS consolidation labels
+- Remote `page` starts at 1; `pageSize` defaults to 10 and is clamped to 50. Large pages split into whole-row responses with `offset` and `revision`; follow `nextCall` to finish that remote page before advancing, keeping `pageSize` fixed
 - Use `documentType: "sfs"` for consolidated statutes; narrow slow full-text searches with `session` or `documentType`
 
 ---
 
 ### `riksdag_get_document` <sub>tool</sub>
 
-- Required `documentId` from search, or an unambiguous SFS identifier such as `1974:152`; missing records return `found: false`
-- Omit `sections` for metadata, the complete outline, and the first text page; select `metadata`, `decisions`, `reservations`, `activities`, `properties`, `attachments`, `references`, `text`, or `source_html`
-- Text and HTML use Unicode code-point offsets (`textOffset` / `htmlOffset`); lengths default to 1,000 and explicit `textLength` / `htmlLength` values are honored. Array sections use `sectionOffset` / `sectionLimit` (default 20, maximum applied 100)
-- Follow `nextTextCall`, `nextHtmlCall`, or each `sectionPages[].nextCall`, retaining `revision`; changed records fail with `revision_changed`. Attachments are links, not downloaded files
-- SFS `versionKind: "consolidated"` describes published consolidated text, which may include future-effective provisions; it is not an as-enacted or point-in-time legal version
+- Required `documentId` from search, or an SFS identifier (`1974:152`, `SFS 1974:152`, `sfs-1974-152`); misses return `found: false`. Omit `sections` for metadata, the outline, and the first text page, or select from `metadata`, `decisions`, `reservations`, `activities`, `properties`, `attachments`, `references`, `stakeholders`, `text`, `source_html`
+- Text and HTML page by Unicode code point (`textOffset` / `textLength`, `htmlOffset` / `htmlLength`), starting at 8,000 by default and fitting the complete response. Explicit lengths are honored. Array sections use `sectionOffset` / `sectionLimit` (default 20, clamped to 100). Follow `nextTextCall`, `nextHtmlCall`, or `sectionPages[].nextCall` with `revision`; a changed record fails with `revision_changed`
+- Decisions and notice properties expose readable Markdown alongside original HTML. Published summary tables retain every table and its totals; stakeholders retain source names, parties, roles, order, and available numeric member IDs
+- SFS text is the published consolidation (`versionKind: "consolidated"`) and can include future-effective provisions; it is not an as-enacted or point-in-time version. Attachments are returned as links, never downloaded
 
 ---
 
 ### `riksdag_search_speeches` <sub>tool</sub>
 
-- `mode: "search"` (default) requires `session`; optional `memberId`, `party`, and `speechType: "all" | "speech"` narrow the selection, with `speech` excluding replies
-- `headingContains` matches all tokens against headings and subheadings, ignoring case and diacritics; it never searches speech body text
-- Local `offset` pagination; `limit` defaults to 5 and is clamped to 20. `textCount` defaults to 1, is clamped to 5, and accepts 0 for metadata only
-- `mode: "get"` requires a retrieval `speechId` copied from search, not `sourceSpeechId`; get mode rejects search filters. `textOffset` and optional `textLength` read the whole published body through `nextTextCall`; the default text page is 1,000 code points
-- `textState` is `included`, `not_requested`, `unavailable`, or `failed`; transient hydration failures include recovery details. Retain `revision` on search or text continuations
+- `mode: "search"` (default) requires `session`; optional `memberId`, `party`, `speechType: "all" | "speech"` (`speech` excludes replies), and `headingContains`, which matches all tokens in headings and subheadings, never body text. `limit` defaults to 5 (max 20); `textCount` defaults to 1 (max 5, `0` for metadata only)
+- `mode: "get"` reads one `speechId` copied from a search item (not `sourceSpeechId`) and pages the body with `textOffset` / `textLength` and `nextTextCall`. Default text pages start at 8,000 code points and fit the complete response; explicit lengths are honored
+- `textState` is `included`, `not_requested`, `unavailable`, or `failed`, with recovery details on transient failures; retain `revision` on continuations
+- A missing detail, including an exact zero-byte HTTP 200 source response, returns `found: false` in get mode or `textState: "unavailable"` during search hydration
 
 ---
 
 ### `riksdag_get_votes` <sub>tool</sub>
 
-- Required `mode` and `session`; `mode: "report"` takes `report` (designation or session:designation) or a report `documentId`, while `mode: "member"` requires `memberId` and permits `party`
-- Report mode returns authoritative decisions and complete party groups. Select one `point`, or use `pointOffset` / `pointLimit` (default 5, maximum applied 10); member mode uses `offset` / `limit` (default 20, maximum applied 500)
-- Published main votes only, not every ballot round. `rollCallState` is `available`, `acclamation`, `not_published`, or `unknown`; acclamation requires explicit decision evidence, never merely empty vote rows
-- Missing aggregate counts remain unknown; additional source vote labels stay in `otherVotes`. Follow `nextCall` with `revision` for remaining whole points or member rows
+- Required `mode` and `session`. `mode: "report"` takes `report` (`FiU20` or `2024/25:FiU20`) or a report `documentId`, plus one `point` or `pointOffset` / `pointLimit` (default 5, max 10); `mode: "member"` takes `memberId`, optional `party`, and `offset` / `limit` (default 20, max 500)
+- Report points carry the authoritative decision and party aggregates separated by source `avser`; `rollCallState` is `available`, `acclamation`, `not_published`, or `unknown`, and acclamation requires explicit decision evidence, never just empty vote rows. Incomplete groups retain unknown counts and observed labels; extra vote labels land in `otherVotes`
+- With an explicit report `point`, `ballots: true` adds individual `votes` and independent `ballotPage` pagination using `offset` / `limit`. Follow `ballotPage.nextCall` with both `revision` and `ballotRevision`; report-point counts keep their existing meaning
+- Published main votes only, not every ballot round; follow `nextCall` with `revision` for remaining points or rows
 
 ---
 
 ### `riksdag_search_members` <sub>tool</sub>
 
-- Optional `nameContains` matches all tokens ignoring case and diacritics; `party` and `constituency` accept codes or exact reference labels
-- `sitting: "all" | "serving" | "not_serving"` defaults to `all`; this filters source service classification, not verified sitting or elected membership. Historical entries and ministers can appear, and unknown classifications remain in `all`
-- Local `offset` pagination; `limit` defaults to 20 and is clamped to 100. Returns `candidateCount`, exact filtered `totalCount`, `revision`, and `nextCall`
-- Keep leading zeros in `memberId`. Some European Parliament entries have no IID and return `detailAvailable: false`; their `sourceRecordId` is a different identifier and cannot be used with `riksdag_get_member`
+- `register: "service"` (default) searches current members plus recent former members, substitutes, and ministers; `register: "all"` includes earlier records. A cold all-register request is substantially larger and can reach the normal timeout
+- Optional `nameContains` matches all tokens as substrings, ignoring case and diacritics. `party` and `constituency` accept codes or exact labels. `sitting: "all" | "serving" | "not_serving"` (default `all`) filters source service labels, including serving substitutes, without establishing elected membership
+- `offset` pagination; `limit` defaults to 20, clamped to 100. Returns actual `candidateCount`, filtered `totalCount`, `sourceReportedCount`, `revision`, and `nextCall`. Source-reported hits can differ from returned all-register records; a notice discloses this, and neither count is an independent historical census
+- `memberId` keeps leading zeros. Entries without an IID return `detailAvailable: false`; their `sourceRecordId` is a different identifier and can't be passed to `riksdag_get_member`
 
 ---
 
 ### `riksdag_get_member` <sub>tool</sub>
 
-- Required numeric-string `memberId` from search, including leading zeros; missing entries return `found: false` with guidance
-- Published register metadata and assignments in source order; `assignmentOffset` / `assignmentLimit` default to 0 / 20, with a maximum applied limit of 100
-- `assignmentTotal`, `nextCall`, and `revision` allow complete traversal. Assignment dates retain source precision and do not establish historical sitting status; contact details and photographs are excluded
+- Required numeric-string `memberId`, leading zeros included; copy it from a member search result with `detailAvailable: true`. Misses return `found: false` with guidance
+- Register metadata and assignments in source order; `assignmentOffset` / `assignmentLimit` default to 0 / 20 (max 100), with `assignmentTotal`, `nextCall`, and `revision`
+- Assignment dates keep source precision and don't establish historical sitting status; contact details and photographs are excluded
 
 ## Features
 
@@ -120,94 +126,32 @@ Agent-friendly output:
 
 ## Getting started
 
-Add the following to your MCP client configuration file.
+Connect to the hosted instance, no install:
 
-```json
-{
-  "mcpServers": {
-    "sweden-parliament-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/sweden-parliament-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
-    }
-  }
-}
+```sh
+claude mcp add --transport http sweden-parliament-mcp-server https://sweden-parliament.caseyjhand.com/mcp
 ```
 
-Or with npx (no Bun required):
+Or run it locally:
+
+```sh
+claude mcp add sweden-parliament-mcp-server -- npx -y @cyanheads/sweden-parliament-mcp-server
+```
+
+For other MCP clients, add this to your configuration:
 
 ```json
 {
   "mcpServers": {
     "sweden-parliament-mcp-server": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/sweden-parliament-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
+      "args": ["-y", "@cyanheads/sweden-parliament-mcp-server"]
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "sweden-parliament-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "ghcr.io/cyanheads/sweden-parliament-mcp-server:latest"]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# Server listens at http://localhost:3010/mcp
-```
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
-- Riksdagen Open Data requires no API key or account.
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/sweden-parliament-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd sweden-parliament-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment:**
-
-```sh
-cp .env.example .env
-# edit .env for optional transport, authentication, or logging overrides
-```
+Riksdagen Open Data requires no API key or account. For Docker or a source build, see [Running the server](#running-the-server).
 
 ## Configuration
 
@@ -228,6 +172,16 @@ See [`.env.example`](./.env.example) for every server setting and the common fra
 
 ### Local development
 
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+
+```sh
+git clone https://github.com/cyanheads/sweden-parliament-mcp-server.git
+cd sweden-parliament-mcp-server && bun install
+cp .env.example .env
+```
+
+The environment file is optional; edit it for transport, authentication, or logging overrides.
+
 - **Build and run the production version**:
 
   ```sh
@@ -245,6 +199,14 @@ See [`.env.example`](./.env.example) for every server setting and the common fra
   bun run devcheck  # Lints, formats, type-checks, and more
   bun run test      # Runs the test suite
   ```
+
+### Docker
+
+```sh
+docker run --rm -p 3010:3010 ghcr.io/cyanheads/sweden-parliament-mcp-server:latest
+```
+
+The image uses stateless HTTP and writes logs to `/var/log/sweden-parliament-mcp-server`. For stdio, use `docker run -i --rm -e MCP_TRANSPORT_TYPE=stdio ghcr.io/cyanheads/sweden-parliament-mcp-server:latest` as the client launch command. Build locally with `docker build -t sweden-parliament-mcp-server .`; add `--build-arg OTEL_ENABLED=false` to omit the optional OpenTelemetry dependencies.
 
 ## Project structure
 

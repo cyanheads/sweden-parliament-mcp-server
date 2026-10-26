@@ -1,6 +1,6 @@
 # sweden-parliament-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 12:20:37
+Generated on: 2026-10-26 03:51:02
 
 ```text
 sweden-parliament-mcp-server/
@@ -36,6 +36,8 @@ sweden-parliament-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -172,18 +174,25 @@ sweden-parliament-mcp-server/
 │   │   ├── reference-contract.int.test.ts
 │   │   ├── speeches-contract.int.test.ts
 │   │   ├── unicode-documents.int.test.ts
+│   │   ├── vote-summary-parity.int.test.ts
 │   │   └── votes-contract.int.test.ts
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   ├── bundle-agent-docs-timing.test.ts
+│   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   └── riksdag/
 │   │       ├── cache-wire.test.ts
+│   │       ├── document-evolution.test.ts
 │   │       ├── document-fixtures.ts
 │   │       ├── documents.test.ts
 │   │       ├── member-fixtures.ts
 │   │       ├── members.test.ts
 │   │       ├── normalize.test.ts
+│   │       ├── pagination-timing.test.ts
 │   │       ├── pagination.test.ts
+│   │       ├── point-ballots.test.ts
 │   │       ├── speech-fixtures.ts
 │   │       ├── speeches.test.ts
 │   │       ├── text-output.test.ts
@@ -196,6 +205,8 @@ sweden-parliament-mcp-server/
 │       ├── documents.tool.test.ts
 │       ├── list-reference.tool.test.ts
 │       ├── members.tool.test.ts
+│       ├── output-ceilings.tool.test.ts
+│       ├── report-ballots.tool.test.ts
 │       ├── speeches.tool.test.ts
 │       └── votes.tool.test.ts
 ├── .dockerignore
@@ -213,7 +224,9 @@ sweden-parliament-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

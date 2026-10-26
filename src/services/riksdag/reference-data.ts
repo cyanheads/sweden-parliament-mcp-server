@@ -1,4 +1,4 @@
-/** @file src/services/riksdag/reference-data.ts — Dated public Riksdagen vocabulary snapshot and identifier guidance. */
+/** @fileoverview Dated public Riksdagen vocabulary snapshot and identifier guidance. @module services/riksdag/reference-data */
 
 /** Source verification date; catalog timestamps retain the source's local precision. */
 export const REFERENCE_VERIFIED_AT = '2026-10-25';
@@ -2557,7 +2557,7 @@ export const REFERENCE_TABLES: Readonly<Record<ReferenceTopic, readonly Referenc
       code: 'memberId',
       labelSv: 'Intressent-id',
       explanation:
-        'Use the numeric intressent_id string, preserving leading zeros; register sourceid UUIDs are different identifiers.',
+        'Use the numeric intressent_id string, preserving leading zeros. Historical UUID identities are returned as sourceRecordId with detailAvailable false and cannot be passed to member detail.',
     },
     {
       code: 'speechId',
@@ -2569,7 +2569,7 @@ export const REFERENCE_TABLES: Readonly<Record<ReferenceTopic, readonly Referenc
       code: 'session',
       labelSv: 'Riksmöte',
       explanation:
-        'Use a legacy calendar year or YYYY/YY; 1999/00 normalizes to the published 1999/2000. Syntactically valid future sessions are accepted even when absent from this snapshot.',
+        'Use a legacy calendar year, YYYY/YY, or consecutive YYYY/YYYY. Full-year ranges normalize to YYYY/YY except the published 1999/2000 form; 1999/00 also normalizes to 1999/2000. Well-formed future sessions are accepted even when absent from this snapshot.',
     },
   ],
   coverage: [
@@ -2595,7 +2595,7 @@ export const REFERENCE_TABLES: Readonly<Record<ReferenceTopic, readonly Referenc
       code: 'members',
       labelSv: 'Ledamöter',
       explanation:
-        'Register records are strongest from around 1990. rdlstatus=tjanst includes historical service and ministers, not only sitting members. Serving, former service, substitutes, leave and ministers differ; unknown labels stay unknown. Assignment end dates can be erroneous and do not establish historical sitting status.',
+        'Register records are strongest from around 1990. Member search defaults to register service, covering current and recent service plus ministers; register all reaches earlier records with a larger cold request that can time out. Source-reported hits and returned records can differ. Serving substitutes are included in source service classification; unknown labels stay unknown. Assignment dates do not establish historical sitting status.',
     },
     {
       code: 'sfs',

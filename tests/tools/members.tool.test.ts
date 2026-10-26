@@ -8,7 +8,12 @@ import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksda
 
 describe('member tool inputs', () => {
   it('applies defaults and rejects invalid numeric boundaries', () => {
-    expect(riksdagSearchMembers.input.parse({})).toEqual({ sitting: 'all', offset: 0, limit: 20 });
+    expect(riksdagSearchMembers.input.parse({})).toEqual({
+      register: 'service',
+      sitting: 'all',
+      offset: 0,
+      limit: 20,
+    });
     expect(riksdagGetMember.input.parse({ memberId: '0001' })).toEqual({
       memberId: '0001',
       assignmentOffset: 0,
@@ -16,10 +21,10 @@ describe('member tool inputs', () => {
     });
     for (const input of [
       { limit: 0 },
-      { limit: 10001 },
       { offset: -1 },
       { offset: 0.5 },
       { sitting: 'elected' },
+      { register: 'historical' },
     ])
       expect(riksdagSearchMembers.input.safeParse(input).success).toBe(false);
     for (const input of [

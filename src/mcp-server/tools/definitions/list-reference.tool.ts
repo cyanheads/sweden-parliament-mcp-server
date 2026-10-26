@@ -1,4 +1,4 @@
-/** @file src/mcp-server/tools/definitions/list-reference.tool.ts — Offline official vocabulary and source conventions. */
+/** @fileoverview Offline official vocabulary and source conventions. @module mcp-server/tools/definitions/list-reference.tool */
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import {
   effectiveQuery,
@@ -13,7 +13,13 @@ import {
   REFERENCE_SOURCES,
   REFERENCE_TABLES,
   REFERENCE_VERIFIED_AT,
+  type ReferenceTopic,
 } from '../../../services/riksdag/reference-data.js';
+
+const catalogTimestamps: Partial<Record<ReferenceTopic, string>> = REFERENCE_CATALOG_TIMESTAMPS;
+/** Orders by UTF-16 code units, not locale collation. */
+const compareCodeUnits = (left: string, right: string) =>
+  left < right ? -1 : left > right ? 1 : 0;
 
 const topicSchema = z.enum([
   'document_types',
@@ -75,7 +81,6 @@ export const listReference = tool('riksdag_list_reference', {
       .number()
       .int()
       .min(1)
-      .max(10000)
       .default(20)
       .describe('Requested entries; values above 100 are clamped with a notice.'),
   }),
@@ -139,17 +144,11 @@ export const listReference = tool('riksdag_list_reference', {
       retrievedAt: REFERENCE_VERIFIED_AT,
       notices,
     };
-    const rows = [...REFERENCE_TABLES[input.topic]].sort((a, b) =>
-      a.code < b.code
-        ? -1
-        : a.code > b.code
-          ? 1
-          : (a.subtype ?? '') < (b.subtype ?? '')
-            ? -1
-            : (a.subtype ?? '') > (b.subtype ?? '')
-              ? 1
-              : 0,
+    const rows = REFERENCE_TABLES[input.topic].toSorted(
+      (a, b) =>
+        compareCodeUnits(a.code, b.code) || compareCodeUnits(a.subtype ?? '', b.subtype ?? ''),
     );
+    const referenceCatalogTimestamp = catalogTimestamps[input.topic];
     const result = fitRows({
       rows,
       offset: input.offset,
@@ -158,9 +157,6 @@ export const listReference = tool('riksdag_list_reference', {
       build: (entries, appliedLimit, truncated) => {
         const nextOffset = input.offset + entries.length;
         const hasMore = nextOffset < rows.length;
-        const referenceCatalogTimestamp = Object.hasOwn(REFERENCE_CATALOG_TIMESTAMPS, input.topic)
-          ? REFERENCE_CATALOG_TIMESTAMPS[input.topic as keyof typeof REFERENCE_CATALOG_TIMESTAMPS]
-          : undefined;
         return {
           topic: input.topic,
           entries,

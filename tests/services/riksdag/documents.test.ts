@@ -138,7 +138,8 @@ describe('document endpoint contracts', () => {
       expect(result.record.decisions[2]).toMatchObject({
         point: 3,
         heading: 'Punkt 3',
-        proposal: '<p>Förslag 3</p>',
+        proposal: 'Förslag 3',
+        proposalSourceHtml: '<p>Förslag 3</p>',
         decisionType: 'röstning',
         voteId: 'vote-3',
         winner: 'utskottet',

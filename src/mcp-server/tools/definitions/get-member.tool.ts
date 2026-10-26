@@ -30,7 +30,6 @@ const argsSchema = z.object({
     .number()
     .int()
     .min(1)
-    .max(10000)
     .default(20)
     .describe('Requested assignments; applied maximum 100.'),
   revision: z.string().optional().describe('Revision returned by the preceding assignment page.'),

@@ -24,7 +24,9 @@ const assignmentWire = z.object({
   intressent_id: s,
 });
 const memberWire = z.object({
-  intressent_id: s.refine((value) => value === undefined || /^\d+$/.test(value)),
+  intressent_id: s.refine(
+    (value) => value === undefined || /^\d+$/.test(value) || z.uuid().safeParse(value).success,
+  ),
   sourceid: s,
   tilltalsnamn: s,
   efternamn: s,
@@ -36,7 +38,8 @@ const memberWire = z.object({
     .object({
       uppdrag: collectionOf(assignmentWire),
     })
-    .nullish(),
+    .nullish()
+    .or(z.literal('').transform(() => undefined)),
 });
 const registerWire = z.object({
   personlista: z.object({
@@ -52,7 +55,7 @@ export const memberSchema = z
       .string()
       .optional()
       .describe(
-        'Numeric register IID, including leading zeros; absent for some European Parliament entries.',
+        'Numeric register IID, including leading zeros; absent for some historical and European Parliament entries.',
       ),
     sourceRecordId: z
       .string()
@@ -97,6 +100,9 @@ export const assignmentSchema = z
 function classification(status: string | undefined): 'serving' | 'not_serving' | 'unknown' {
   if (
     status === 'Tjänstgörande riksdagsledamot' ||
+    status === 'Tjänstgörande ersättare' ||
+    status === 'Tjänstgörande statsrådsersättare' ||
+    status === 'Tjänstgörande talmansersättare' ||
     status?.endsWith('(tjänstgörande riksdagsledamot)')
   )
     return 'serving';
@@ -123,10 +129,14 @@ function identityFailure(): never {
 }
 function metadata(row: z.infer<typeof memberWire>): z.infer<typeof memberSchema> {
   const names = [row.tilltalsnamn, row.efternamn].filter((name) => name !== undefined);
+  const memberId =
+    row.intressent_id !== undefined && /^\d+$/.test(row.intressent_id)
+      ? row.intressent_id
+      : undefined;
   return {
-    memberId: row.intressent_id,
-    sourceRecordId: row.sourceid,
-    detailAvailable: row.intressent_id !== undefined,
+    memberId,
+    sourceRecordId: row.sourceid ?? (memberId === undefined ? row.intressent_id : undefined),
+    detailAvailable: memberId !== undefined,
     name: names.length ? names.join(' ') : undefined,
     givenName: row.tilltalsnamn,
     familyName: row.efternamn,
@@ -145,8 +155,9 @@ function validate(
   root: z.infer<typeof registerWire>['personlista'],
   party?: string,
   memberId?: string,
+  register: 'service' | 'all' = 'service',
 ): void {
-  if (root['@hits'] !== root.person.length)
+  if (register === 'service' && root['@hits'] !== root.person.length)
     throw schemaInvalid('Member register hit count contradicts its returned rows.');
   if (root.person.length >= 50_000)
     throw new McpError(
@@ -156,6 +167,19 @@ function validate(
     );
   const seen = new Set<string>();
   for (const row of root.person) {
+    if (
+      row.intressent_id !== undefined &&
+      !/^\d+$/.test(row.intressent_id) &&
+      row.sourceid !== row.intressent_id
+    )
+      throw schemaInvalid('Historical member UUID contradicts its source identity.');
+    if (
+      row.intressent_id !== undefined &&
+      !/^\d+$/.test(row.intressent_id) &&
+      row.person_url_xml !== undefined &&
+      sourceUrl(row.person_url_xml) !== `https://data.riksdagen.se/person/${row.intressent_id}`
+    )
+      identityFailure();
     const identity = row.intressent_id ?? row.sourceid;
     if (identity === undefined)
       throw schemaInvalid('Member register row lacks both IID and source record identity.');
@@ -174,20 +198,25 @@ function validate(
   if (memberId !== undefined && root.person.length > 1) identityFailure();
 }
 
-/** Fetches one complete service register; @hits counts this returned register, unlike @antal. */
+/** Fetches the selected register; source-reported hits remain distinct from returned rows. */
 export async function loadMembers(
   service: RiksdagService,
   budget: ToolBudget,
-  filters: { party?: string; memberId?: string } = {},
+  filters: { party?: string; memberId?: string; register?: 'service' | 'all' } = {},
 ) {
   const loaded = await service.loadJson(
     {
       path: '/personlista/',
-      query: { rdlstatus: 'tjanst', utformat: 'json', parti: filters.party, iid: filters.memberId },
+      query: {
+        rdlstatus: filters.register === 'all' ? 'samtliga' : 'tjanst',
+        utformat: 'json',
+        parti: filters.party,
+        iid: filters.memberId,
+      },
       schema: registerWire,
       ttlMs: 300000,
       cacheable: (data) => {
-        validate(data.personlista, filters.party, filters.memberId);
+        validate(data.personlista, filters.party, filters.memberId, filters.register);
         return data.personlista.person.length > 0;
       },
     },
@@ -195,7 +224,7 @@ export async function loadMembers(
   );
   if (!loaded.found)
     throw schemaInvalid('Member register unexpectedly returned a missing HTTP response.');
-  validate(loaded.data.personlista, filters.party, filters.memberId);
+  validate(loaded.data.personlista, filters.party, filters.memberId, filters.register);
   const records = loaded.data.personlista.person.map((row) => ({
     ...metadata(row),
     assignments: (row.personuppdrag?.uppdrag ?? []).map((assignment) => ({
@@ -209,5 +238,9 @@ export async function loadMembers(
     })),
   }));
   budget.check();
-  return { records, retrievedAt: loaded.retrievedAt };
+  return {
+    records,
+    sourceReportedCount: loaded.data.personlista['@hits'],
+    retrievedAt: loaded.retrievedAt,
+  };
 }

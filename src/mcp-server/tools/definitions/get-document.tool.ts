@@ -9,6 +9,7 @@ import {
   documentPropertySchema,
   documentReferenceSchema,
   documentReservationSchema,
+  documentStakeholderSchema,
   loadDocumentStatus,
 } from '../../../services/riksdag/documents.js';
 import { normalizeDocumentId, optionalString } from '../../../services/riksdag/normalize.js';
@@ -20,9 +21,18 @@ import {
   successEnrichment,
   successEnrichmentTrailer,
 } from '../../../services/riksdag/output.js';
-import { fitRows, fitText } from '../../../services/riksdag/pagination.js';
+import {
+  fitRows,
+  fitTextPages,
+  RESPONSE_TARGET_BYTES,
+  type TextPageSource,
+} from '../../../services/riksdag/pagination.js';
 import { getRiksdagService } from '../../../services/riksdag/riksdag-service.js';
-import { assertRevision, codePointLength } from '../../../services/riksdag/text.js';
+import {
+  assertRevision,
+  codePointLength,
+  sliceCodePoints,
+} from '../../../services/riksdag/text.js';
 import { createToolBudget } from '../../../services/riksdag/transport.js';
 
 const sectionKeys = [
@@ -33,6 +43,7 @@ const sectionKeys = [
   'properties',
   'attachments',
   'references',
+  'stakeholders',
   'text',
   'source_html',
 ] as const;
@@ -44,6 +55,7 @@ const arrayKeys = [
   'properties',
   'attachments',
   'references',
+  'stakeholders',
 ] as const;
 const inputSchema = z.object({
   documentId: z
@@ -54,7 +66,7 @@ const inputSchema = z.object({
     .array(z.string())
     .optional()
     .describe(
-      'Select metadata, decisions, reservations, activities, properties, attachments, references, text or source_html. Omit for metadata, complete outline and first text page.',
+      'Select metadata, decisions, reservations, activities, properties, attachments, references, stakeholders, text or source_html. Omit for metadata, complete outline and first text page.',
     ),
   textOffset: z.number().int().min(0).default(0).describe('Text offset in Unicode code points.'),
   textLength: z
@@ -62,7 +74,9 @@ const inputSchema = z.object({
     .int()
     .min(1)
     .optional()
-    .describe('Explicit text length in code points; default 1000 and honored when supplied.'),
+    .describe(
+      'Explicit text length in code points; defaults start at 8000 and fit the complete response; explicit lengths are honored.',
+    ),
   htmlOffset: z
     .number()
     .int()
@@ -74,7 +88,9 @@ const inputSchema = z.object({
     .int()
     .min(1)
     .optional()
-    .describe('Explicit source HTML length in code points; default 1000.'),
+    .describe(
+      'Explicit source HTML length in code points; defaults start at 8000 and fit the complete response; explicit lengths are honored.',
+    ),
   sectionOffset: z
     .number()
     .int()
@@ -85,7 +101,6 @@ const inputSchema = z.object({
     .number()
     .int()
     .min(1)
-    .max(10000)
     .default(20)
     .describe('Requested entries per selected array section; applied maximum 100.'),
   revision: z
@@ -142,6 +157,10 @@ const outputSchema = z.object({
     .optional()
     .describe('Selected linked-attachment page.'),
   references: z.array(documentReferenceSchema).optional().describe('Selected relationship page.'),
+  stakeholders: z
+    .array(documentStakeholderSchema)
+    .optional()
+    .describe('Selected page of source participants, retaining entries without an IID.'),
   sectionPages: z
     .array(
       z
@@ -253,11 +272,12 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
     for (const key of selected)
       if (!sectionSchema.safeParse(key).success)
         throw ctx.fail('unknown_section', `Unknown document section: ${key}`);
+    const revision = optionalString(input.revision);
     const args = {
       ...input,
       documentId,
       sectionLimit: Math.min(input.sectionLimit, 100),
-      ...(optionalString(input.revision) ? { revision: optionalString(input.revision) } : {}),
+      revision,
     };
     const loaded = await loadDocumentStatus(getRiksdagService(), documentId, budget);
     const enrichment: SuccessEnrichment = {
@@ -278,36 +298,29 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
       };
     }
     const record = loaded.record;
-    assertRevision(optionalString(input.revision), record.revision);
+    assertRevision(revision, record.revision);
     const continuationArgs = { ...args, revision: record.revision };
     const output: z.infer<typeof outputSchema> = {
       found: true,
       documentId,
       truncated: false,
       revision: record.revision,
-      outline: sectionKeys.map((section) =>
-        section === 'metadata'
-          ? { section, available: true, itemCount: 1 }
-          : section === 'text'
-            ? {
-                section,
-                available: record.text !== undefined,
-                ...(record.text === undefined ? {} : { textLength: codePointLength(record.text) }),
-              }
-            : section === 'source_html'
-              ? {
-                  section,
-                  available: record.sourceHtml !== undefined,
-                  ...(record.sourceHtml === undefined
-                    ? {}
-                    : { textLength: codePointLength(record.sourceHtml) }),
-                }
-              : {
-                  section,
-                  available: record[section].length > 0,
-                  itemCount: record[section].length,
-                },
-      ),
+      outline: sectionKeys.map((section) => {
+        if (section === 'metadata') return { section, available: true, itemCount: 1 };
+        if (section === 'text' || section === 'source_html') {
+          const body = section === 'text' ? record.text : record.sourceHtml;
+          return {
+            section,
+            available: body !== undefined,
+            ...(body === undefined ? {} : { textLength: codePointLength(body) }),
+          };
+        }
+        return {
+          section,
+          available: record[section].length > 0,
+          itemCount: record[section].length,
+        };
+      }),
       textAvailable: record.text !== undefined,
     };
     if (selected.includes('metadata')) output.metadata = record.metadata;
@@ -361,98 +374,123 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
         enrichment.notices.push(`Section ${section} offset is beyond its available entries.`);
     }
     output.truncated = output.sectionPages.some((page) => page.hasMore || page.truncated);
+    const textSources: (TextPageSource & { section: 'text' | 'source_html' })[] = [];
     if (selected.includes('text')) {
       output.textRepresentation = record.textRepresentation;
       if (record.text !== undefined) {
-        const text = record.text;
-        const textTotalLength = codePointLength(text);
-        Object.assign(
-          output,
-          fitText({
-            text,
-            offset: input.textOffset,
-            ...(input.textLength === undefined ? {} : { length: input.textLength }),
-            enrichment,
-            budget,
-            build: (page, returnedLength) => {
-              const textHasMore = input.textOffset + returnedLength < textTotalLength;
-              return {
-                ...output,
-                text: page,
-                textOffset: input.textOffset,
-                textTotalLength,
-                textReturnedLength: returnedLength,
-                textHasMore,
-                ...(textHasMore
-                  ? {
-                      nextTextCall: {
-                        toolName: 'riksdag_get_document' as const,
-                        args: {
-                          ...continuationArgs,
-                          sections: ['text'],
-                          textOffset: input.textOffset + returnedLength,
-                        },
-                      },
-                    }
-                  : {}),
-              };
-            },
-          }),
-        );
-        if (input.textOffset > textTotalLength)
-          enrichment.notices.push(
+        textSources.push({
+          section: 'text',
+          text: record.text,
+          offset: input.textOffset,
+          ...(input.textLength === undefined ? {} : { length: input.textLength }),
+          pastEndNotice:
             'Text offset is beyond the published body; this is an empty terminal page.',
-          );
+        });
       }
     }
     if (selected.includes('source_html') && record.sourceHtml !== undefined) {
-      const html = record.sourceHtml;
-      const htmlTotalLength = codePointLength(html);
-      Object.assign(
-        output,
-        fitText({
-          text: html,
-          offset: input.htmlOffset,
-          ...(input.htmlLength === undefined ? {} : { length: input.htmlLength }),
-          enrichment,
-          budget,
-          build: (page, returnedLength) => {
-            const htmlHasMore = input.htmlOffset + returnedLength < htmlTotalLength;
-            return {
-              ...output,
-              sourceHtml: page,
-              htmlOffset: input.htmlOffset,
-              htmlTotalLength,
-              htmlReturnedLength: returnedLength,
-              htmlHasMore,
-              ...(htmlHasMore
-                ? {
-                    nextHtmlCall: {
-                      toolName: 'riksdag_get_document' as const,
-                      args: {
-                        ...continuationArgs,
-                        sections: ['source_html'],
-                        htmlOffset: input.htmlOffset + returnedLength,
-                      },
-                    },
-                  }
-                : {}),
-            };
-          },
-        }),
-      );
-      if (input.htmlOffset > htmlTotalLength)
-        enrichment.notices.push(
+      textSources.push({
+        section: 'source_html',
+        text: record.sourceHtml,
+        offset: input.htmlOffset,
+        ...(input.htmlLength === undefined ? {} : { length: input.htmlLength }),
+        pastEndNotice:
           'HTML offset is beyond the published source; this is an empty terminal page.',
-        );
+      });
     }
-    if (measureResponse(output, enrichment) > 24576)
+    const buildTextPages = (
+      pages: {
+        source: (typeof textSources)[number];
+        text: string;
+        returnedLength: number;
+        totalLength: number;
+      }[],
+    ) => {
+      const result = { ...output };
+      for (const page of pages) {
+        const { source, totalLength: total } = page;
+        const { section } = source;
+        const hasMore = source.offset + page.returnedLength < total;
+        const nextCall = hasMore
+          ? {
+              toolName: 'riksdag_get_document' as const,
+              args: {
+                ...continuationArgs,
+                sections: [section],
+                ...(section === 'text'
+                  ? { textOffset: source.offset + page.returnedLength }
+                  : { htmlOffset: source.offset + page.returnedLength }),
+              },
+            }
+          : undefined;
+        if (section === 'text')
+          Object.assign(result, {
+            text: page.text,
+            textOffset: source.offset,
+            textTotalLength: total,
+            textReturnedLength: page.returnedLength,
+            textHasMore: hasMore,
+            ...(nextCall ? { nextTextCall: nextCall } : {}),
+          });
+        else
+          Object.assign(result, {
+            sourceHtml: page.text,
+            htmlOffset: source.offset,
+            htmlTotalLength: total,
+            htmlReturnedLength: page.returnedLength,
+            htmlHasMore: hasMore,
+            ...(nextCall ? { nextHtmlCall: nextCall } : {}),
+          });
+      }
+      return result;
+    };
+    const minimumText = textSources.map((source) => {
+      const totalLength = codePointLength(source.text);
+      return {
+        source,
+        totalLength,
+        text: sliceCodePoints(source.text, source.offset, 1),
+        returnedLength: source.offset < totalLength ? 1 : 0,
+      };
+    });
+    while (measureResponse(buildTextPages(minimumText), enrichment) > RESPONSE_TARGET_BYTES) {
+      budget.check();
+      const page = output.sectionPages
+        .filter((entry) => entry.returnedCount > 1)
+        .sort((left, right) => right.returnedCount - left.returnedCount)[0];
+      if (!page) break;
+      const entries = record[page.section].slice(page.offset, page.offset + page.returnedCount - 1);
+      Object.assign(output, { [page.section]: entries });
+      page.returnedCount = entries.length;
+      page.limit = entries.length;
+      page.truncated = true;
+      page.hasMore = true;
+      page.nextCall = {
+        toolName: 'riksdag_get_document',
+        args: {
+          ...continuationArgs,
+          sections: [page.section],
+          sectionOffset: page.offset + entries.length,
+        },
+      };
+      output.truncated = true;
+      const notice =
+        'The selected array pages were shortened to fit the complete response; follow each section continuation for remaining entries.';
+      if (!enrichment.notices.includes(notice)) enrichment.notices.push(notice);
+    }
+    const fitted = fitTextPages({
+      sources: textSources,
+      enrichment,
+      budget,
+      build: buildTextPages,
+    });
+    if (measureResponse(fitted, enrichment) > RESPONSE_TARGET_BYTES)
       enrichment.notices.push(
         'Selected document data exceeds the response target and is returned intact. Select fewer sections or follow individual section continuation calls.',
       );
     budget.check();
     ctx.enrich(enrichment);
-    return output;
+    return fitted;
   },
   format: formatExact,
 });

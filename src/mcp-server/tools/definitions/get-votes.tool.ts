@@ -22,11 +22,12 @@ import {
 } from '../../../services/riksdag/output.js';
 import { fitRows, RESPONSE_TARGET_BYTES } from '../../../services/riksdag/pagination.js';
 import { getRiksdagService } from '../../../services/riksdag/riksdag-service.js';
-import { assertRevision } from '../../../services/riksdag/text.js';
+import { assertRevision, revisionOf } from '../../../services/riksdag/text.js';
 import { createToolBudget } from '../../../services/riksdag/transport.js';
 import {
   hydrateVotePoint,
   loadMemberVotes,
+  loadPointBallots,
   loadVoteReport,
   memberVoteSchema,
   reportPointSchema,
@@ -57,19 +58,25 @@ const inputSchema = z.object({
   party: optionalText.describe(
     'Member-mode local party filter; report party groups are always complete.',
   ),
+  ballots: z
+    .boolean()
+    .optional()
+    .describe('Report mode only: include individual ballots for an explicit point; default false.'),
+  ballotRevision: optionalText.describe(
+    'Returned ballot-page revision for consistent report-ballot continuation.',
+  ),
   offset: z
     .number()
     .int()
     .nonnegative()
     .optional()
-    .describe('Member-mode local row offset; default 0.'),
+    .describe('Member or explicit report-ballot local row offset; default 0.'),
   limit: z
     .number()
     .int()
     .positive()
-    .max(10000)
     .optional()
-    .describe('Member-mode requested rows; default 20, applied maximum 500.'),
+    .describe('Member or report-ballot requested rows; default 20, applied maximum 500.'),
   pointOffset: z
     .number()
     .int()
@@ -80,7 +87,6 @@ const inputSchema = z.object({
     .number()
     .int()
     .positive()
-    .max(10000)
     .optional()
     .describe('All-points report page size; default 5, applied maximum 10.'),
   revision: optionalText.describe(
@@ -117,7 +123,7 @@ const outputSchema = z.object({
   votes: z
     .array(memberVoteSchema)
     .optional()
-    .describe('Whole member main-vote rows after local filtering and pagination.'),
+    .describe('Whole member or explicit report-point main ballots after local pagination.'),
   candidateCount: z
     .number()
     .int()
@@ -158,13 +164,29 @@ const outputSchema = z.object({
   nextCall: nextCallSchema
     .optional()
     .describe('Complete continuation advancing by actual returned entries.'),
+  ballotPage: z
+    .object({
+      revision: z.string().describe('Revision of the complete point-ballot selection.'),
+      totalCount: z.number().int().nonnegative().describe('Exact complete point-ballot count.'),
+      returnedCount: z.number().int().nonnegative().describe('Returned whole ballot rows.'),
+      offset: z.number().int().nonnegative().describe('Applied ballot row offset.'),
+      limit: z.number().int().positive().describe('Applied ballot limit after fitting.'),
+      requestedLimit: z.number().int().positive().describe('Requested ballot row limit.'),
+      truncated: z.boolean().describe('Response fitting shortened this ballot page.'),
+      hasMore: z.boolean().describe('More whole ballots remain.'),
+      nextCall: nextCallSchema.optional().describe('Complete report-ballot continuation call.'),
+    })
+    .optional()
+    .describe(
+      'Independent ballot pagination; report-point counts and revision retain their meanings.',
+    ),
 });
 
 /** Read main votes without mistaking missing publication for acclamation. */
 export const riksdagGetVotes = tool('riksdag_get_votes', {
   title: 'Read parliamentary main votes',
   description:
-    'Read authoritative report decisions and complete party main-vote groups, or a member’s session main votes. Report mode requires report or documentId; member mode requires memberId. Follow complete local continuation calls. Main votes do not include every ballot round; empty rows never prove acclamation.',
+    'Read authoritative report decisions and party main-vote groups separated by avser, or a member’s session main votes. Report mode requires report or documentId; ballots true with an explicit point adds individual member ballots and independent ballotPage continuation. Member mode requires memberId. Follow complete local continuation calls. Main votes do not include every ballot round; empty rows never prove acclamation.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: inputSchema,
   output: outputSchema,
@@ -183,7 +205,7 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
       code: JsonRpcErrorCode.Conflict,
       when: 'The complete record changed during continuation.',
       recovery:
-        'Restart the same tool without revision and begin at the first page to read one consistent record.',
+        'Restart the same tool without revision or ballotRevision and begin at the first page to read one consistent record.',
       thrownBy: 'service',
     },
     {
@@ -234,9 +256,9 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
     {
       reason: 'candidate_limit_reached',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Complete-list or grouped-count boundary is reached.',
+      when: 'The complete main-ballot candidate boundary is reached.',
       recovery:
-        'In member mode, retry riksdag_get_votes with a party filter. A saturated report-point party group has no narrower complete traversal on this source.',
+        'In member mode, retry riksdag_get_votes with a party filter. A saturated report-point ballot selection has no narrower complete traversal on this source.',
       thrownBy: 'service',
     },
   ],
@@ -247,15 +269,18 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
       if (
         input.memberId !== undefined ||
         input.party !== undefined ||
-        input.offset !== undefined ||
-        input.limit !== undefined ||
+        (!input.ballots &&
+          (input.offset !== undefined ||
+            input.limit !== undefined ||
+            input.ballotRevision !== undefined)) ||
+        (input.ballots && input.point === undefined) ||
         (!input.report && !input.documentId) ||
         (input.point !== undefined &&
           (input.pointOffset !== undefined || input.pointLimit !== undefined))
       )
         throw ctx.fail(
           'invalid_filter',
-          'Report mode requires report or documentId, rejects member fields, and a single point cannot use point pagination.',
+          'Report mode requires report or documentId and rejects member fields. Ballots require an explicit point; row pagination and ballotRevision require ballots. A single point cannot use point pagination.',
         );
     } else if (
       !input.memberId ||
@@ -263,7 +288,9 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
       input.documentId !== undefined ||
       input.point !== undefined ||
       input.pointOffset !== undefined ||
-      input.pointLimit !== undefined
+      input.pointLimit !== undefined ||
+      input.ballots !== undefined ||
+      input.ballotRevision !== undefined
     ) {
       throw ctx.fail(
         'invalid_filter',
@@ -380,15 +407,16 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
       };
     }
     assertRevision(input.revision, loaded.revision);
-    const selected =
+    const requestedDecision =
       input.point === undefined
-        ? loaded.decisions
-        : loaded.decisions.filter((decision) => decision.point === input.point);
-    if (input.point !== undefined && selected.length === 0)
+        ? undefined
+        : loaded.decisions.find((decision) => decision.point === input.point);
+    if (input.point !== undefined && requestedDecision === undefined)
       throw ctx.fail(
         'unknown_point',
         'The authoritative report does not contain the requested point.',
       );
+    const selected = requestedDecision ? [requestedDecision] : loaded.decisions;
     if (pointOffset > selected.length)
       enrichment.notices.push(
         'The point offset is beyond the report catalog; this is an empty terminal page.',
@@ -429,32 +457,140 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
           : {}),
       };
     };
+    if (input.ballots && requestedDecision) {
+      const decision = requestedDecision;
+      const ballots = await loadPointBallots(
+        service,
+        session,
+        loaded.report,
+        loaded.documentId,
+        decision.point,
+        budget,
+      );
+      const ballotRevision = await revisionOf(ballots.rows);
+      assertRevision(input.ballotRevision, ballotRevision);
+      const point = await hydrateVotePoint(
+        service,
+        session,
+        loaded.report,
+        loaded.documentId,
+        decision,
+        budget,
+        ballots,
+      );
+      points.push(point);
+      const unassignedPartyBallotCount = ballots.rows.filter(
+        (row) => row.party === undefined,
+      ).length;
+      if (unassignedPartyBallotCount)
+        enrichment.notices.push(
+          `Point ${decision.point}: ${unassignedPartyBallotCount} published ballots omit party identity and cannot be assigned to named party aggregates; individual ballots retain these rows.`,
+        );
+      if (point.parties.some((party) => party.observedVoteLabels !== undefined))
+        enrichment.notices.push(
+          `Point ${decision.point}: some ballots omit vote labels; exact counts remain unknown for those party/avser groups. Observed labels retain their source wording.`,
+        );
+      const offset = input.offset ?? 0;
+      const requestedLimit = input.limit ?? 20;
+      const limit = Math.min(requestedLimit, 500);
+      Object.assign(enrichment, {
+        effectiveQuery: effectiveQuery({ ...args, ballots: true, offset, limit }),
+        ...(ballots.upstreamQuery ? { upstreamQuery: ballots.upstreamQuery } : {}),
+        ...(ballots.upstreamWarnings ? { upstreamWarnings: ballots.upstreamWarnings } : {}),
+      });
+      if (requestedLimit > 500) enrichment.notices.push('Requested limit was clamped to 500.');
+      if (ballots.rows.length === 0)
+        enrichment.notices.push(
+          'No main ballots are published for this point; only explicit decision evidence establishes acclamation.',
+        );
+      if (offset > ballots.rows.length)
+        enrichment.notices.push(
+          'The ballot offset is beyond the complete result; this is an empty terminal page.',
+        );
+      const result = fitRows({
+        rows: ballots.rows,
+        offset,
+        limit,
+        enrichment,
+        budget,
+        build: (votes, appliedLimit, truncated): z.infer<typeof outputSchema> => {
+          const hasMore = offset + votes.length < ballots.rows.length;
+          return {
+            ...build(false),
+            votes,
+            ballotPage: {
+              revision: ballotRevision,
+              totalCount: ballots.rows.length,
+              returnedCount: votes.length,
+              offset,
+              limit: appliedLimit,
+              requestedLimit,
+              truncated,
+              hasMore,
+              ...(hasMore
+                ? {
+                    nextCall: {
+                      toolName: 'riksdag_get_votes',
+                      args: {
+                        ...args,
+                        report: loaded.report,
+                        documentId: loaded.documentId,
+                        ballots: true,
+                        offset: offset + votes.length,
+                        limit,
+                        revision: loaded.revision,
+                        ballotRevision,
+                      },
+                    },
+                  }
+                : {}),
+            },
+          };
+        },
+      });
+      budget.check();
+      ctx.enrich(enrichment);
+      return result;
+    }
     let truncated = false;
     for (const decision of selected.slice(pointOffset, pointOffset + pointLimit)) {
       budget.check();
-      points.push(
-        await hydrateVotePoint(
-          service,
-          session,
-          loaded.report,
-          loaded.documentId,
-          decision,
-          budget,
-        ),
+      const ballots = await loadPointBallots(
+        service,
+        session,
+        loaded.report,
+        loaded.documentId,
+        decision.point,
+        budget,
       );
+      const point = await hydrateVotePoint(
+        service,
+        session,
+        loaded.report,
+        loaded.documentId,
+        decision,
+        budget,
+        ballots,
+      );
+      points.push(point);
+      const unassignedPartyBallotCount = ballots.rows.filter(
+        (row) => row.party === undefined,
+      ).length;
+      if (unassignedPartyBallotCount)
+        enrichment.notices.push(
+          `Point ${decision.point}: ${unassignedPartyBallotCount} published ballots omit party identity and cannot be assigned to named party aggregates; request ballots true with this point to inspect every row.`,
+        );
       if (
-        points
-          .at(-1)
-          ?.parties.some(
-            (party) =>
-              party.yes === undefined ||
-              party.no === undefined ||
-              party.abstain === undefined ||
-              party.absent === undefined,
-          )
+        point.parties.some(
+          (party) =>
+            party.yes === undefined ||
+            party.no === undefined ||
+            party.abstain === undefined ||
+            party.absent === undefined,
+        )
       )
         enrichment.notices.push(
-          `Point ${decision.point}: blank or absent aggregate cells remain unknown, not zero; any explicit summary-table counts retain their separate decision provenance.`,
+          `Point ${decision.point}: some ballots omit vote labels; exact counts remain unknown, not zero for those party/avser groups. Observed labels and explicit summary-table counts retain their separate source evidence.`,
         );
       if (measureResponse(build(false), enrichment) > RESPONSE_TARGET_BYTES) {
         truncated =

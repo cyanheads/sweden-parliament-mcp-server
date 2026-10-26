@@ -59,6 +59,7 @@ export type QueryParameters = Readonly<Record<string, string | number | undefine
 export interface JsonLoadSpec<S extends z.ZodType> {
   cacheable?: (data: z.output<S>) => boolean;
   expected404?: boolean;
+  expectedEmpty200?: boolean;
   path: string;
   query?: QueryParameters;
   schema: S;
@@ -75,6 +76,8 @@ type TransportResult<T> =
   | { found: false; retrievedAt: string };
 
 const ORIGIN = 'https://data.riksdagen.se';
+const ROUTE =
+  /^\/(?:dokumentlista|dokumentstatus|anforandelista|anforande|voteringlista|personlista)(?:\/|$)/;
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
 /** Owns permits through body consumption, releasing them before retry backoff. */
@@ -88,22 +91,11 @@ export class RiksdagTransport {
 
   /** Constructs a deterministic fixed-origin key, rejecting non-route input. */
   url(path: string, query: QueryParameters = {}): URL {
-    if (
-      !/^\/(?:dokumentlista|dokumentstatus|anforandelista|anforande|voteringlista|personlista)(?:\/|\?|$)/.test(
-        path,
-      ) ||
-      path.includes('?') ||
-      path.includes('#') ||
-      path.includes('\\')
-    )
+    if (!ROUTE.test(path) || /[?#\\]/.test(path))
       throw new Error('Riksdag endpoint modules must supply a fixed supported route.');
     const url = new URL(path, ORIGIN);
     this.#assertOrigin(url);
-    if (
-      !/^\/(?:dokumentlista|dokumentstatus|anforandelista|anforande|voteringlista|personlista)(?:\/|$)/.test(
-        url.pathname,
-      )
-    )
+    if (!ROUTE.test(url.pathname))
       throw new Error('A Riksdag route cannot contain path traversal.');
     for (const [key, value] of Object.entries(query).sort(([a], [b]) => a.localeCompare(b))) {
       if (value !== undefined) url.searchParams.set(key, String(value));
@@ -144,11 +136,10 @@ export class RiksdagTransport {
                 }
                 if (!response.ok) {
                   await response.body?.cancel();
-                  const error = await httpErrorFromResponse(response, {
+                  throw await httpErrorFromResponse(response, {
                     service: 'Riksdagen',
                     captureBody: false,
                   });
-                  throw error;
                 }
                 const text = response.body
                   ? await new Response(
@@ -158,6 +149,8 @@ export class RiksdagTransport {
                       .catch((error: unknown) => this.#networkError(error))
                   : '';
                 budget.check();
+                if (response.status === 200 && spec.expectedEmpty200 && text.length === 0)
+                  return { found: false as const, retrievedAt };
                 if (/^\s*<(?:!doctype\s+html|html(?:\s|>))/i.test(text)) {
                   if (
                     spec.expected404 &&

@@ -37,6 +37,112 @@ function domainText(result: Awaited<ReturnType<typeof runToolContract>>): unknow
   );
 }
 describe('member public contracts', () => {
+  it('keeps all-register scope, substring filtering and source counts across cached continuations', async () => {
+    const rows = [
+      {
+        intressent_id: '0001',
+        tilltalsnamn: 'Göran',
+        efternamn: 'Synthetic',
+        status: 'Tjänstgörande ersättare',
+      },
+      {
+        intressent_id: '0002',
+        tilltalsnamn: 'Göran',
+        efternamn: 'Synthetic',
+        status: 'Tjänstgörande statsrådsersättare',
+      },
+      {
+        intressent_id: '12345678-1234-4234-8234-123456789abc',
+        sourceid: '12345678-1234-4234-8234-123456789abc',
+        tilltalsnamn: 'Göran',
+        efternamn: 'Synthetic',
+        personuppdrag: '',
+      },
+    ];
+    const network = vi.fn<typeof fetch>().mockImplementation(async (url) =>
+      Response.json({
+        personlista: {
+          '@hits': new URL(String(url)).searchParams.get('rdlstatus') === 'samtliga' ? '4' : '3',
+          person: rows,
+        },
+      }),
+    );
+    initRiksdagService({ fetch: network });
+    const first = await runToolContract(riksdagSearchMembers, {
+      register: 'all',
+      nameContains: 'oran ynthe',
+      limit: 1,
+    });
+    const enrichment = assertSuccess(first);
+    expect(enrichment.effectiveQuery).toContain('all');
+    expect(enrichment.notices.join(' ')).toContain('Source-reported hits (4)');
+    const page = riksdagSearchMembers.output.parse(first.structuredContent);
+    expect(page).toMatchObject({
+      sourceReportedCount: 4,
+      candidateCount: 3,
+      totalCount: 3,
+      nextCall: { args: { register: 'all' } },
+    });
+    expect(domainText(first)).toEqual(page);
+    const second = await runToolContract(riksdagSearchMembers, page.nextCall!.args);
+    const secondPage = riksdagSearchMembers.output.parse(second.structuredContent);
+    expect(assertSuccess(second).retrievedAt).toBe(enrichment.retrievedAt);
+    expect(domainText(second)).toEqual(secondPage);
+    const third = await runToolContract(riksdagSearchMembers, secondPage.nextCall!.args);
+    assertSuccess(third);
+    expect(third.structuredContent).toMatchObject({
+      items: [{ detailAvailable: false, sourceRecordId: rows[2]!.sourceid }],
+      hasMore: false,
+    });
+    expect(domainText(third)).toEqual(riksdagSearchMembers.output.parse(third.structuredContent));
+    for (const args of [
+      { register: 'all', offset: 99 },
+      { register: 'all', nameContains: 'absent' },
+    ] as const) {
+      const empty = await runToolContract(riksdagSearchMembers, args);
+      assertSuccess(empty);
+      expect(empty.structuredContent).toMatchObject({ items: [], hasMore: false });
+      expect(domainText(empty)).toEqual(riksdagSearchMembers.output.parse(empty.structuredContent));
+    }
+    const serving = await runToolContract(riksdagSearchMembers, {
+      register: 'all',
+      sitting: 'serving',
+    });
+    assertSuccess(serving);
+    expect(serving.structuredContent).toMatchObject({ totalCount: 2 });
+    expect(network).toHaveBeenCalledTimes(1);
+    expect(String(network.mock.calls[0]?.[0])).toBe(
+      'https://data.riksdagen.se/personlista/?rdlstatus=samtliga&utformat=json',
+    );
+    const wrongScope = await runToolContract(riksdagSearchMembers, { revision: page.revision });
+    expect(wrongScope).toMatchObject({
+      isError: true,
+      structuredContent: { error: { data: { reason: 'revision_changed' } } },
+    });
+    expect(wrongScope.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'text', text: expect.stringContaining('Restart') }),
+      ]),
+    );
+  });
+  it('uses shared substitute classification in exact member detail', async () => {
+    initRiksdagService({
+      fetch: async () =>
+        Response.json({
+          personlista: {
+            '@hits': '1',
+            person: { intressent_id: '0001', status: 'Tjänstgörande talmansersättare' },
+          },
+        }),
+    });
+    const result = await runToolContract(riksdagGetMember, { memberId: '0001' });
+    assertSuccess(result);
+    expect(result.structuredContent).toMatchObject({
+      serviceClassification: 'serving',
+      status: 'Tjänstgörande talmansersättare',
+    });
+    expect(domainText(result)).toEqual(riksdagGetMember.output.parse(result.structuredContent));
+  });
   it.each(['schema', 'wrong-iid', 'multiple-iid', 'assignment-identity'])(
     'preserves %s errors and recovery on both public surfaces',
     async (kind) => {
@@ -254,7 +360,7 @@ describe('member public contracts', () => {
     expect(invalid.isError).toBe(true);
     expect(network).toHaveBeenCalledTimes(1);
   });
-  it.each([100, 101])(
+  it.each([100, 101, 100000])(
     'reports requested search limit %i and traverses variable fitted pages without repeats',
     async (limit) => {
       const rows = Array.from({ length: 105 }, (_, i) => ({
@@ -276,9 +382,7 @@ describe('member public contracts', () => {
         expect(page.requestedLimit).toBe(args.limit);
         expect(page.offset).toBe(ids.length);
         if (ids.length === 0)
-          expect(enrichment.notices.some((notice) => notice.includes('clamped'))).toBe(
-            limit === 101,
-          );
+          expect(enrichment.notices.some((notice) => notice.includes('clamped'))).toBe(limit > 100);
         for (const member of page.items) ids.push(member.memberId!);
         if (!page.nextCall) break;
         expect(page.nextCall.args.offset).toBe(ids.length);
@@ -287,7 +391,7 @@ describe('member public contracts', () => {
       expect(ids).toEqual(Array.from({ length: 105 }, (_, i) => String(i).padStart(4, '0')));
     },
   );
-  it.each([100, 101])(
+  it.each([100, 101, 100000])(
     'reports requested assignment limit %i and preserves all source-order assignments',
     async (assignmentLimit) => {
       const person = memberDetail(105);
@@ -306,7 +410,7 @@ describe('member public contracts', () => {
         expect(page.assignmentOffset).toBe(organs.length);
         if (!organs.length)
           expect(enrichment.notices.some((notice) => notice.includes('clamped'))).toBe(
-            assignmentLimit === 101,
+            assignmentLimit > 100,
           );
         organs.push(...(page.assignments ?? []).map((entry) => entry.organ!));
         if (!page.nextCall) break;
@@ -408,35 +512,38 @@ describe('member public contracts', () => {
       ]),
     );
   });
-  it('directs a saturated member search back to the same tool with a usable party filter', async () => {
-    initRiksdagService({
-      fetch: async () =>
-        Response.json({
-          personlista: {
-            '@hits': '50000',
-            person: Array.from({ length: 50000 }, (_, i) => ({ intressent_id: String(i + 1) })),
-          },
-        }),
-    });
-    const result = await runToolContract(riksdagSearchMembers, {});
-    expect(result).toMatchObject({
-      isError: true,
-      structuredContent: {
-        error: {
-          data: {
-            reason: 'candidate_limit_reached',
-            recovery: { hint: expect.stringContaining('riksdag_search_members') },
+  it.each(['service', 'all'] as const)(
+    'directs a saturated %s member search back to the same tool with a usable party filter',
+    async (register) => {
+      initRiksdagService({
+        fetch: async () =>
+          Response.json({
+            personlista: {
+              '@hits': '50000',
+              person: Array.from({ length: 50000 }, (_, i) => ({ intressent_id: String(i + 1) })),
+            },
+          }),
+      });
+      const result = await runToolContract(riksdagSearchMembers, { register });
+      expect(result).toMatchObject({
+        isError: true,
+        structuredContent: {
+          error: {
+            data: {
+              reason: 'candidate_limit_reached',
+              recovery: { hint: expect.stringContaining('riksdag_search_members') },
+            },
           },
         },
-      },
-    });
-    const text = result.content
-      .filter((block) => block.type === 'text')
-      .map((block) => block.text)
-      .join('\n');
-    expect(text).toContain('riksdag_search_members');
-    expect(text).toContain('party');
-  });
+      });
+      const text = result.content
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+      expect(text).toContain('riksdag_search_members');
+      expect(text).toContain('party');
+    },
+  );
   it('discloses requested and applied search limits and measured whole-row shortening', async () => {
     initRiksdagService({
       fetch: async () =>

@@ -21,6 +21,12 @@ import { assertRevision, revisionOf } from '../../../services/riksdag/text.js';
 import { createToolBudget } from '../../../services/riksdag/transport.js';
 
 const argsSchema = z.object({
+  register: z
+    .enum(['service', 'all'])
+    .default('service')
+    .describe(
+      'Register scope; all includes historical records and can require a large cold request that reaches the normal timeout.',
+    ),
   nameContains: z
     .string()
     .optional()
@@ -35,25 +41,26 @@ const argsSchema = z.object({
     .default('all')
     .describe('Source service classification; all retains unknown status.'),
   offset: z.number().int().min(0).default(0).describe('Local row offset.'),
-  limit: z
-    .number()
-    .int()
-    .min(1)
-    .max(10000)
-    .default(20)
-    .describe('Requested rows; applied maximum 100.'),
+  limit: z.number().int().min(1).default(20).describe('Requested rows; applied maximum 100.'),
   revision: z.string().optional().describe('Revision returned by a preceding page.'),
 });
 /** Finds member IDs without treating the service register as sitting membership. */
 export const riksdagSearchMembers = tool('riksdag_search_members', {
   title: 'Search parliamentary members',
   description:
-    'Find members and ministers by name, party, constituency and service status. Service-register entries include historical records; use riksdag_get_member for assignment history.',
+    'Find members and ministers by name, party, constituency and service status. Defaults to the service register; register all includes earlier source records through a larger cold request that may time out. Use numeric memberId with riksdag_get_member for assignment history.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: argsSchema,
   output: z.object({
     items: z.array(memberSchema).describe('Filtered member-register rows.'),
-    candidateCount: z.number().describe('Complete upstream candidate count.'),
+    candidateCount: z
+      .number()
+      .describe('Actual returned candidate records in the selected register scope.'),
+    sourceReportedCount: z
+      .number()
+      .describe(
+        'Source-reported register hits; may differ from actual returned candidates in all scope.',
+      ),
     totalCount: z.number().describe('Exact count after local filtering.'),
     returnedCount: z.number().describe('Rows in this page.'),
     offset: z.number().describe('Applied local offset.'),
@@ -134,6 +141,7 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
       partyInput = optionalString(input.party),
       constituencyInput = optionalString(input.constituency);
     const filters = {
+      register: input.register,
       nameContains: name,
       party: partyInput ? normalizeCode(partyInput, 'parties') : undefined,
       constituency: constituencyInput
@@ -144,17 +152,16 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
       limit: Math.min(input.limit, 100),
     };
     const tokens = name ? normalizeTokens(name) : [];
-    const loaded = await loadMembers(
-      getRiksdagService(),
-      budget,
-      filters.party ? { party: filters.party } : {},
-    );
+    const loaded = await loadMembers(getRiksdagService(), budget, {
+      register: filters.register,
+      ...(filters.party === undefined ? {} : { party: filters.party }),
+    });
     const candidates = loaded.records
       .map(({ assignments: _assignments, ...member }) => member)
       .sort((a, b) =>
         (a.memberId ?? a.sourceRecordId ?? '').localeCompare(b.memberId ?? b.sourceRecordId ?? ''),
       );
-    const revision = await revisionOf(candidates);
+    const revision = await revisionOf({ register: filters.register, candidates });
     assertRevision(optionalString(input.revision), revision);
     const rows = candidates.filter(
       (member) =>
@@ -171,6 +178,15 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
       ],
     };
     if (input.limit > 100) enrichment.notices.push('Requested limit was clamped to 100.');
+    if (filters.register === 'all') {
+      enrichment.notices.push(
+        'All-register scope covers returned source records, not an independently verified historical census. Cold requests can reach the normal timeout.',
+      );
+      if (loaded.sourceReportedCount !== candidates.length)
+        enrichment.notices.push(
+          `Source-reported hits (${loaded.sourceReportedCount}) differ from returned candidate records (${candidates.length}); totals count returned records.`,
+        );
+    }
     if (rows.some((member) => !member.detailAvailable))
       enrichment.notices.push(
         'Some entries have no published member IID: detailAvailable is false and sourceRecordId is a distinct register UUID. Read their sourceUrl; do not pass the UUID to riksdag_get_member.',
@@ -190,6 +206,7 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
         return {
           items,
           candidateCount: candidates.length,
+          sourceReportedCount: loaded.sourceReportedCount,
           totalCount: rows.length,
           returnedCount: items.length,
           offset: filters.offset,

@@ -6,6 +6,170 @@ import { createToolBudget } from '@/services/riksdag/transport.js';
 import { memberDetail } from './member-fixtures.js';
 
 describe('member register endpoint', () => {
+  it('leaves an oversized all-register response uncached under the existing bound', async () => {
+    const network = vi.fn<typeof fetch>().mockImplementation(async () =>
+      Response.json({
+        personlista: {
+          '@hits': '1',
+          person: { intressent_id: '0001' },
+          extra: 'x'.repeat(32 * 1024 * 1024),
+        },
+      }),
+    );
+    const service = new RiksdagService({ fetch: network });
+    using budget = createToolBudget();
+    try {
+      for (let i = 0; i < 2; i++)
+        expect((await loadMembers(service, budget, { register: 'all' })).records).toHaveLength(1);
+      expect(network).toHaveBeenCalledTimes(2);
+    } finally {
+      service.dispose();
+    }
+  });
+  it('keeps member identity timing bounded across input shapes', async () => {
+    for (const shape of ['digits', 'line-end', 'line-breaks']) {
+      let firstCpuMs = 0;
+      let lastCpuMs = 0;
+      const maximum = shape === 'digits' ? 320000 : 40000;
+      for (let size = 5000; size <= maximum; size *= 2) {
+        const id =
+          shape === 'digits'
+            ? '1'.repeat(size)
+            : shape === 'line-end'
+              ? `${'§1 x'.repeat(size / 4)}\ny`
+              : '  \r\n'.repeat(size / 4);
+        const service = new RiksdagService({
+          fetch: async () =>
+            Response.json({ personlista: { '@hits': '1', person: { intressent_id: id } } }),
+        });
+        using budget = createToolBudget();
+        const started = process.threadCpuUsage();
+        try {
+          for (let repeat = 0; repeat < 8; repeat++) {
+            if (shape === 'digits') await loadMembers(service, budget);
+            else
+              await expect(loadMembers(service, budget)).rejects.toMatchObject({
+                data: { reason: 'upstream_schema_invalid' },
+              });
+          }
+        } finally {
+          service.dispose();
+        }
+        const cpu = process.threadCpuUsage(started);
+        const cpuMs = (cpu.user + cpu.system) / 1000;
+        expect(cpuMs).toBeLessThan(1000);
+        if (size === 5000) firstCpuMs = cpuMs;
+        lastCpuMs = cpuMs;
+      }
+      if (shape === 'digits') expect(lastCpuMs / firstCpuMs).toBeLessThan(256);
+    }
+  });
+  it.each([
+    { intressent_id: '12345678-1234-4234-8234-123456789abc', sourceid: 'different' },
+    {
+      intressent_id: '12345678-1234-4234-8234-123456789abc',
+      sourceid: '12345678-1234-4234-8234-123456789abc',
+      person_url_xml: 'https://example.org/person',
+    },
+    { intressent_id: 'not-an-iid' },
+  ])('rejects invalid historical identities without caching', async (person) => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => Response.json({ personlista: { '@hits': '1', person } }));
+    const service = new RiksdagService({ fetch: network });
+    using budget = createToolBudget();
+    try {
+      for (let i = 0; i < 2; i++)
+        await expect(loadMembers(service, budget, { register: 'all' })).rejects.toThrow();
+      expect(network).toHaveBeenCalledTimes(2);
+    } finally {
+      service.dispose();
+    }
+  });
+  it.each([
+    'Tjänstgörande ersättare',
+    'Tjänstgörande statsrådsersättare',
+    'Tjänstgörande talmansersättare',
+  ])('recognizes observed substitute %s', async (status) => {
+    const service = new RiksdagService({
+      fetch: async () =>
+        Response.json({ personlista: { '@hits': '1', person: { intressent_id: '0001', status } } }),
+    });
+    using budget = createToolBudget();
+    try {
+      expect((await loadMembers(service, budget)).records[0]?.serviceClassification).toBe(
+        'serving',
+      );
+    } finally {
+      service.dispose();
+    }
+  });
+  it('does not infer service from an unrecognized serving prefix or assignment dates', async () => {
+    const service = new RiksdagService({
+      fetch: async () =>
+        Response.json({
+          personlista: {
+            '@hits': '1',
+            person: {
+              intressent_id: '0001',
+              status: 'Tjänstgörande okänd roll',
+              personuppdrag: { uppdrag: { from: '1900-01-01', tom: '2999-12-31' } },
+            },
+          },
+        }),
+    });
+    using budget = createToolBudget();
+    try {
+      expect((await loadMembers(service, budget)).records[0]?.serviceClassification).toBe(
+        'unknown',
+      );
+    } finally {
+      service.dispose();
+    }
+  });
+  it('loads historical UUID records and sparse history with honest all-register counts', async () => {
+    const network = vi.fn<typeof fetch>().mockImplementation(async () =>
+      Response.json({
+        personlista: {
+          '@hits': '3',
+          person: [
+            { intressent_id: '0001', tilltalsnamn: 'Synthetic' },
+            {
+              intressent_id: '12345678-1234-4234-8234-123456789abc',
+              sourceid: '12345678-1234-4234-8234-123456789abc',
+              personuppdrag: '',
+              person_url_xml:
+                'https://data.riksdagen.se/person/12345678-1234-4234-8234-123456789abc',
+            },
+          ],
+        },
+      }),
+    );
+    const service = new RiksdagService({ fetch: network });
+    using budget = createToolBudget();
+    try {
+      const result = await loadMembers(service, budget, { register: 'all' });
+      expect(result).toMatchObject({
+        sourceReportedCount: 3,
+        records: [
+          { memberId: '0001' },
+          {
+            memberId: undefined,
+            sourceRecordId: '12345678-1234-4234-8234-123456789abc',
+            detailAvailable: false,
+            assignments: [],
+          },
+        ],
+      });
+      await loadMembers(service, budget, { register: 'all' });
+      expect(network).toHaveBeenCalledTimes(1);
+      expect(String(network.mock.calls[0]?.[0])).toBe(
+        'https://data.riksdagen.se/personlista/?rdlstatus=samtliga&utformat=json',
+      );
+    } finally {
+      service.dispose();
+    }
+  });
   it('preserves leading-zero IID, source UUID and assignment source order/date precision', async () => {
     const network = vi
       .fn<typeof fetch>()

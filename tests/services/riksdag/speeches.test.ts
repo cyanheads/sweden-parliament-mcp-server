@@ -8,6 +8,34 @@ import { speechList, speechRow } from './speech-fixtures.js';
 const filters = { session: '2024/25', speechType: 'all' as const };
 
 describe('speech endpoint contracts', () => {
+  it('treats only zero-byte successful detail as an uncached miss', async () => {
+    const network = vi.fn<typeof fetch>().mockImplementation(async () => new Response(''));
+    const service = new RiksdagService({ fetch: network });
+    using budget = createToolBudget();
+    try {
+      for (let i = 0; i < 2; i++)
+        await expect(loadSpeechDetail(service, budget, 'HC091-9999')).resolves.toMatchObject({
+          found: false,
+        });
+      expect(network).toHaveBeenCalledTimes(2);
+      await expect(loadSpeechCandidates(service, budget, filters)).rejects.toMatchObject({
+        data: { reason: 'upstream_schema_invalid' },
+      });
+    } finally {
+      service.dispose();
+    }
+  });
+  it.each([' ', '{'])('retains malformed nonempty detail failure for %j', async (body) => {
+    const service = new RiksdagService({ fetch: async () => new Response(body) });
+    using budget = createToolBudget();
+    try {
+      await expect(loadSpeechDetail(service, budget, 'HC091-9999')).rejects.toMatchObject({
+        data: { reason: 'upstream_schema_invalid', retryable: false },
+      });
+    } finally {
+      service.dispose();
+    }
+  });
   it('maps verified filters only and preserves retrieval identity separately from source UUID', async () => {
     const network = vi
       .fn<typeof fetch>()

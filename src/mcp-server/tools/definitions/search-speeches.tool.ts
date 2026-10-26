@@ -17,14 +17,19 @@ import {
   successEnrichment,
   successEnrichmentTrailer,
 } from '../../../services/riksdag/output.js';
-import { fitRows, fitText } from '../../../services/riksdag/pagination.js';
+import { fitRows, fitText, fitTextPages } from '../../../services/riksdag/pagination.js';
 import { getRiksdagService } from '../../../services/riksdag/riksdag-service.js';
 import {
   loadSpeechCandidates,
   loadSpeechDetail,
   speechSchema,
 } from '../../../services/riksdag/speeches.js';
-import { assertRevision, codePointLength, revisionOf } from '../../../services/riksdag/text.js';
+import {
+  assertRevision,
+  codePointLength,
+  revisionOf,
+  sliceCodePoints,
+} from '../../../services/riksdag/text.js';
 import { createToolBudget, type ToolBudget } from '../../../services/riksdag/transport.js';
 
 const argsSchema = z.object({
@@ -89,7 +94,7 @@ const argsSchema = z.object({
     .min(1)
     .optional()
     .describe(
-      'Get only: requested Unicode code points, default 1000; explicit larger lengths are honored.',
+      'Get only: requested Unicode code points; defaults start at 8000 and fit the complete response; explicit lengths are honored.',
     ),
   revision: z
     .string()
@@ -163,6 +168,7 @@ async function detailPage(
   expectedRevision: string | undefined,
   enrichment: SuccessEnrichment,
   budget: ToolBudget,
+  deferredText?: Map<string, { text: string; revision: string }>,
 ): Promise<Item> {
   const revision = await revisionOf({ ...loaded.record, text: loaded.text });
   assertRevision(expectedRevision, revision);
@@ -170,50 +176,58 @@ async function detailPage(
   if (loaded.text === undefined || loaded.text.trim() === '')
     return { ...loaded.record, textState: 'unavailable', textRevision: revision };
   const total = codePointLength(loaded.text);
+  const build = (text: string, returnedLength: number) => {
+    const hasMore = offset + returnedLength < total;
+    const item: Item = {
+      ...loaded.record,
+      textState: 'included' as const,
+      text,
+      textOffset: offset,
+      textTotalLength: total,
+      textReturnedLength: returnedLength,
+      textHasMore: hasMore,
+      textRevision: revision,
+      ...(hasMore
+        ? {
+            nextTextCall: getCall(
+              loaded.record.speechId,
+              offset + returnedLength,
+              revision,
+              length,
+            ),
+          }
+        : {}),
+    };
+    return {
+      mode: 'get' as const,
+      found: true,
+      speechId: loaded.record.speechId,
+      item,
+      revision,
+    };
+  };
+  if (deferredText) {
+    deferredText.set(loaded.record.speechId, { text: loaded.text, revision });
+    return build(sliceCodePoints(loaded.text, offset, 1), 1).item;
+  }
   const fitted = fitText({
     text: loaded.text,
     offset,
     ...(length === undefined ? {} : { length }),
     enrichment,
     budget,
-    build: (text, returnedLength) => {
-      const hasMore = offset + returnedLength < total;
-      const item: Item = {
-        ...loaded.record,
-        textState: 'included' as const,
-        text,
-        textOffset: offset,
-        textTotalLength: total,
-        textReturnedLength: returnedLength,
-        textHasMore: hasMore,
-        textRevision: revision,
-        ...(hasMore
-          ? {
-              nextTextCall: getCall(
-                loaded.record.speechId,
-                offset + returnedLength,
-                revision,
-                length,
-              ),
-            }
-          : {}),
-      };
-      return {
-        mode: 'get' as const,
-        found: true,
-        speechId: loaded.record.speechId,
-        item,
-        revision,
-      };
-    },
+    build,
   });
   return fitted.item;
 }
 
-function invalidMode(): never {
-  throw validationError('Speech mode fields conflict or a required mode field is missing.', {
-    reason: 'invalid_filter',
-  });
+function invalidMode(mode: string, missing: string[], conflicting: string[]): never {
+  throw validationError(
+    `Invalid speech ${mode} mode. Missing required fields: ${missing.join(', ') || 'none'}. Conflicting supplied fields: ${conflicting.join(', ') || 'none'}.`,
+    {
+      reason: 'invalid_filter',
+    },
+  );
 }
 
 function transient(error: unknown): error is McpError {
@@ -348,15 +362,12 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
       'limit',
       'textCount',
     ] as const;
-    if (
-      mode === 'get'
-        ? searchKeys.some((key) => input[key] !== undefined) || !optionalString(input.speechId)
-        : input.speechId !== undefined ||
-          input.textOffset !== undefined ||
-          input.textLength !== undefined ||
-          !optionalString(input.session)
-    )
-      invalidMode();
+    const required = mode === 'get' ? 'speechId' : 'session';
+    const missing = optionalString(input[required]) ? [] : [required];
+    const forbidden =
+      mode === 'get' ? searchKeys : (['speechId', 'textOffset', 'textLength'] as const);
+    const conflicting = forbidden.filter((key) => input[key] !== undefined);
+    if (missing.length || conflicting.length) invalidMode(mode, missing, conflicting);
     const service = getRiksdagService();
     if (mode === 'get') {
       const speechId = normalizeSpeechId(input.speechId ?? '');
@@ -472,13 +483,14 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
       budget,
     });
     const items = initial.items;
+    const deferredText = new Map<string, { text: string; revision: string }>();
     for (const [index, item] of items.entries()) {
       if (index >= filters.textCount) break;
       budget.check();
       try {
         const detail = await loadSpeechDetail(service, budget, item.speechId);
         items[index] = detail.found
-          ? await detailPage(detail, 0, undefined, undefined, enrichment, budget)
+          ? await detailPage(detail, 0, undefined, undefined, enrichment, budget, deferredText)
           : { ...item, textState: 'unavailable' };
       } catch (error) {
         budget.check();
@@ -496,13 +508,47 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
         };
       }
     }
-    const result = fitRows({
+    const minimum = fitRows({
       rows: items,
       offset: 0,
       limit: initial.limit,
       build: (selected, limit, truncated) => build(selected, limit, initial.truncated || truncated),
       enrichment,
       budget,
+    });
+    const hydrated = minimum.items.flatMap((item) => {
+      const source = deferredText.get(item.speechId);
+      return source === undefined ? [] : [{ ...source, item, offset: 0 }];
+    });
+    const result = fitTextPages({
+      sources: hydrated,
+      enrichment,
+      budget,
+      build: (pages) => {
+        const textItems = new Map(
+          pages.map((page) => {
+            const { item, revision } = page.source;
+            const hasMore = page.returnedLength < page.totalLength;
+            const { nextTextCall: _nextTextCall, ...metadata } = item;
+            return [
+              item.speechId,
+              {
+                ...metadata,
+                text: page.text,
+                textReturnedLength: page.returnedLength,
+                textHasMore: hasMore,
+                ...(hasMore
+                  ? { nextTextCall: getCall(item.speechId, page.returnedLength, revision) }
+                  : {}),
+              },
+            ];
+          }),
+        );
+        return {
+          ...minimum,
+          items: minimum.items.map((item) => textItems.get(item.speechId) ?? item),
+        };
+      },
     });
     budget.check();
     ctx.enrich(enrichment);

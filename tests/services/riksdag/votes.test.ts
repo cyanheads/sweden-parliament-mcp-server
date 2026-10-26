@@ -72,7 +72,6 @@ describe('main vote endpoints', () => {
     'wrong-iid',
     'wrong-session',
     'wrong-party',
-    'zero-point',
     'echo-iid',
     'echo-session',
   ])('rejects member %s before caching or returning partial data', async (kind) => {
@@ -81,7 +80,6 @@ describe('main vote endpoints', () => {
     if (kind === 'wrong-iid') rows[0]!.intressent_id = '0002';
     if (kind === 'wrong-session') rows[0]!.rm = '2025/26';
     if (kind === 'wrong-party') rows[0]!.parti = 'M';
-    if (kind === 'zero-point') rows[0]!.punkt = '0';
     const network = vi.fn<typeof fetch>().mockImplementation(async () =>
       Response.json({
         voteringlista: {
@@ -117,22 +115,23 @@ describe('main vote endpoints', () => {
       service.dispose();
     }
   });
-  it('preserves sparse group counts, explicit zero and additional vote labels', async () => {
+  it('preserves sparse ballot labels without inventing zero counts', async () => {
     const network = vi.fn<typeof fetch>().mockImplementation(async () =>
       Response.json({
         voteringlista: {
-          '@antal': '1',
+          '@antal': '3',
           '@villkor': 'rm=2024/25:bet=KU1:punkt=4',
-          votering: {
+          votering: ['Annan', 'Annan', undefined].map((rost, i) => ({
+            votering_id: `v${i}`,
+            intressent_id: `000${i}`,
+            rm: '2024/25',
+            beteckning: 'KU1',
+            punkt: '4',
+            dok_id: 'HC01KU1',
             parti: 'S',
-            Ja: '0',
-            Nej: '',
-            Avstår: '  ',
-            Frånvarande: null,
-            Annan: '2',
-            Blank: '',
             avser: 'sakfrågan',
-          },
+            rost,
+          })),
         },
       }),
     );
@@ -152,17 +151,17 @@ describe('main vote endpoints', () => {
         parties: [
           {
             party: 'S',
-            yes: 0,
-            otherVotes: [{ vote: 'Annan', count: 2 }, { vote: 'Blank' }],
+            otherVotes: [{ vote: 'Annan' }],
             avser: 'sakfrågan',
           },
         ],
       });
       expect(result.parties[0]).not.toHaveProperty('no');
+      expect(result.parties[0]).not.toHaveProperty('yes');
       expect(result.parties[0]).not.toHaveProperty('abstain');
       expect(result.parties[0]).not.toHaveProperty('absent');
       expect(String(network.mock.calls[0]?.[0])).toBe(
-        'https://data.riksdagen.se/voteringlista/?bet=KU1&gruppering=parti&punkt=4&rm=2024%2F25&sz=500&utformat=json',
+        'https://data.riksdagen.se/voteringlista/?bet=KU1&punkt=4&rm=2024%2F25&sz=50000&utformat=json',
       );
     } finally {
       service.dispose();
@@ -171,29 +170,32 @@ describe('main vote endpoints', () => {
   it.each([
     'count',
     'missing-count',
-    'duplicate-party',
+    'duplicate-ballot',
     'negative',
     'decimal',
     'session',
     'report',
     'point',
     'echo',
-  ])('rejects grouped %s without caching invalid data', async (kind) => {
+  ])('rejects point ballot %s without caching invalid data', async (kind) => {
     const row = {
       parti: 'S',
+      votering_id: 'v1',
+      intressent_id: '0001',
+      dok_id: 'HC01KU1',
       rm: kind === 'session' ? '2025/26' : '2024/25',
-      bet: kind === 'report' ? 'KU2' : 'KU1',
-      punkt: kind === 'point' ? '2' : '1',
-      Ja: kind === 'negative' ? '-1' : kind === 'decimal' ? '1.5' : '0',
+      beteckning: kind === 'report' ? 'KU2' : 'KU1',
+      punkt: kind === 'point' ? '2' : kind === 'negative' ? '-1' : kind === 'decimal' ? '1.5' : '1',
+      rost: 'Ja',
     };
     const network = vi.fn<typeof fetch>().mockImplementation(async () =>
       Response.json({
         voteringlista: {
           ...(kind === 'missing-count'
             ? {}
-            : { '@antal': kind === 'count' || kind === 'duplicate-party' ? '2' : '1' }),
+            : { '@antal': kind === 'count' || kind === 'duplicate-ballot' ? '2' : '1' }),
           ...(kind === 'echo' ? { '@villkor': 'punkt=2' } : {}),
-          votering: kind === 'duplicate-party' ? [row, row] : row,
+          votering: kind === 'duplicate-ballot' ? [row, row] : row,
         },
       }),
     );
@@ -216,7 +218,7 @@ describe('main vote endpoints', () => {
     }
   });
   it.each(['acklamation', 'röstning', undefined])(
-    'distinguishes empty grouped rows with decision method %s',
+    'distinguishes empty ballot rows with decision method %s',
     async (decisionType) => {
       const service = new RiksdagService({
         fetch: async () => Response.json({ voteringlista: { '@antal': '0' } }),

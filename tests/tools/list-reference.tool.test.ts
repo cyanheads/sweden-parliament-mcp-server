@@ -63,7 +63,6 @@ describe('riksdag_list_reference', () => {
       { topic: 'parties', offset: -1 },
       { topic: 'parties', offset: 0.5 },
       { topic: 'parties', limit: 0 },
-      { topic: 'parties', limit: 10001 },
     ])
       expect(listReference.input.safeParse(args).success).toBe(false);
   });

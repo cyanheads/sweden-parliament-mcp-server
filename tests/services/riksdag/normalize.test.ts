@@ -38,12 +38,26 @@ describe('source identifiers and filters', () => {
     expect(normalizeSession('2030/31')).toBe('2030/31');
     expect(normalizeReport('1999/00:ku1', '1999/2000')).toBe('KU1');
   });
-  it.each(['2025/2026', '2025/27', '1999/99', '25/26', '0000'])(
+  it.each(['2025/2027', '2025/27', '1999/99', '25/26', '0000'])(
     'rejects invalid session %s',
     (session) => {
       expect(() => normalizeSession(session)).toThrow();
     },
   );
+  it('normalizes consecutive full-year sessions and composite report prefixes', () => {
+    expect(normalizeSession(' 2024/2025 ')).toBe('2024/25');
+    expect(normalizeSession('2099/2100')).toBe('2099/00');
+    expect(normalizeReport('2024/2025:KU1', '2024/25')).toBe('KU1');
+    expect(() => normalizeReport('2024/2025:KU1', '2025/26')).toThrow();
+  });
+  it('names the accepted date and session forms and the date ordering constraint', () => {
+    expect(() => normalizeSession('2024/2026')).toThrow('YYYY/YY');
+    expect(() => normalizeDate('2024/13/01')).toThrow('YYYY-MM-DD');
+    expect(() => normalizeDate('2024-02-30')).toThrow('YYYY-MM-DD');
+    expect(() => normalizeDateRange('2025-01-02', '2025-01-01')).toThrow(
+      'dateFrom must be on or before dateTo',
+    );
+  });
   it('rejects unknown codes, subtype labels, arbitrary URLs and disagreeing report sessions', () => {
     for (const run of [
       () => normalizeCode('unknown', 'parties'),

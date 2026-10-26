@@ -1,6 +1,6 @@
-/** @file src/services/riksdag/normalize.ts — Strict source identifier and local filter normalization. */
+/** @fileoverview Strict source identifier and local filter normalization. @module services/riksdag/normalize */
 import { validationError } from '@cyanheads/mcp-ts-core/errors';
-import { REFERENCE_TABLES, type ReferenceTopic } from './reference-data.js';
+import { REFERENCE_TABLES, type ReferenceEntry, type ReferenceTopic } from './reference-data.js';
 
 /** Trim optional input; whitespace-only values are unset. */
 export function optionalString(value: string | undefined): string | undefined {
@@ -8,14 +8,24 @@ export function optionalString(value: string | undefined): string | undefined {
 }
 
 function invalid(field: string): never {
-  throw validationError(
-    `Invalid ${field}; use riksdag_list_reference to check its format or code.`,
-    { reason: 'invalid_filter', field },
-  );
+  const message =
+    field === 'session'
+      ? 'Invalid session; use YYYY/YY, consecutive YYYY/YYYY, or a calendar year YYYY.'
+      : field === 'date'
+        ? 'Invalid date; use a valid Gregorian date in YYYY-MM-DD format.'
+        : field === 'date range'
+          ? 'Invalid date range; dateFrom must be on or before dateTo.'
+          : `Invalid ${field}; use riksdag_list_reference to check its format or code.`;
+  throw validationError(message, { reason: 'invalid_filter', field });
 }
 
 function exactKey(value: string): string {
   return value.trim().normalize('NFC').toLocaleLowerCase('sv-SE');
+}
+
+function uniqueCode(rows: readonly ReferenceEntry[]): string | undefined {
+  const codes = new Set(rows.map((row) => row.code));
+  return codes.size === 1 ? [...codes][0] : undefined;
 }
 
 /** Resolve a code or unique exact Swedish/available English label, preserving official code spelling. */
@@ -25,21 +35,19 @@ export function normalizeCode(
 ): string {
   const key = exactKey(value);
   const rows = REFERENCE_TABLES[topic];
-  const codes = new Set(rows.filter((row) => exactKey(row.code) === key).map((row) => row.code));
-  if (codes.size === 1) return codes.values().next().value ?? invalid(topic);
-  const matches = new Set(
-    rows
-      .filter(
+  return (
+    uniqueCode(rows.filter((row) => exactKey(row.code) === key)) ??
+    uniqueCode(
+      rows.filter(
         (row) =>
           (topic !== 'document_types' || row.subtype === '') &&
           [row.labelSv, row.labelEn].some(
             (label) => label !== undefined && exactKey(label) === key,
           ),
-      )
-      .map((row) => row.code),
+      ),
+    ) ??
+    invalid(topic)
   );
-  if (matches.size !== 1) return invalid(topic);
-  return matches.values().next().value ?? invalid(topic);
 }
 
 /** Normalize published sessions, permitting well-formed sessions newer than the snapshot. */
@@ -48,13 +56,12 @@ export function normalizeSession(value: string): string {
   if (/^[1-9]\d{3}$/.test(session)) return session;
   const match = /^([1-9]\d{3})\/(\d{2}|[1-9]\d{3})$/.exec(session);
   if (!match) return invalid('session');
-  const start = Number(match[1]);
-  const next = start + 1;
-  if (match[2]?.length === 4 ? Number(match[2]) !== next : Number(match[2]) !== next % 100)
-    return invalid('session');
-  if (start === 1999) return '1999/2000';
-  if (match[2]?.length === 4) return invalid('session');
-  return session;
+  const [, startYear = '', end = ''] = match;
+  const start = Number(startYear);
+  if (start === 1999 && (end === '00' || end === '2000')) return '1999/2000';
+  const expectedEnd = end.length === 4 ? start + 1 : (start + 1) % 100;
+  if (Number(end) !== expectedEnd) return invalid('session');
+  return `${startYear}/${String((start + 1) % 100).padStart(2, '0')}`;
 }
 
 /** Canonicalize an ordinary document ID or the three supported unambiguous SFS aliases. */

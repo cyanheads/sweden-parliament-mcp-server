@@ -5,7 +5,7 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { documentDecisionSchema, loadDocumentStatus, resolveReport } from './documents.js';
-import { normalizeReport, normalizeSession } from './normalize.js';
+import { normalizeDocumentId, normalizeReport, normalizeSession } from './normalize.js';
 import type { RiksdagService } from './riksdag-service.js';
 import { revisionOf } from './text.js';
 import type { ToolBudget } from './transport.js';
@@ -45,18 +45,6 @@ const memberList = z.object({
     votering: collectionOf(memberWire),
   }),
 });
-const groupedWire = z
-  .object({ parti: z.string().min(1), rm: s, bet: s, beteckning: s, punkt: s, avser: s })
-  .catchall(z.string().nullish());
-const groupedList = z.object({
-  voteringlista: z.object({
-    '@antal': wireCount.optional(),
-    '@villkor': s,
-    '@q': s,
-    '@varning': s,
-    votering: collectionOf(groupedWire),
-  }),
-});
 
 /** One complete published member main-vote row, without unrelated personal fields. */
 export const memberVoteSchema = z
@@ -93,10 +81,12 @@ const otherVoteSchema = z
       .int()
       .nonnegative()
       .optional()
-      .describe('Published count; absent when its source cell is blank.'),
+      .describe(
+        'Exact counted ballots with this label; absent when the group has ballots without published labels.',
+      ),
   })
   .describe('A published vote label outside the four standard labels.');
-/** Complete party aggregates retain sparse cells and any additional vote labels. */
+/** Party aggregates count complete published ballots without inventing missing labels. */
 export const partyVoteSchema = z
   .object({
     party: z.string().describe('Published party code.'),
@@ -105,26 +95,32 @@ export const partyVoteSchema = z
       .int()
       .nonnegative()
       .optional()
-      .describe('Published Ja count; absent is not zero.'),
+      .describe('Exact Ja ballot count; absent when any group ballot lacks its label.'),
     no: z
       .number()
       .int()
       .nonnegative()
       .optional()
-      .describe('Published Nej count; absent is not zero.'),
+      .describe('Exact Nej ballot count; absent when any group ballot lacks its label.'),
     abstain: z
       .number()
       .int()
       .nonnegative()
       .optional()
-      .describe('Published Avstår count; absent is not zero.'),
+      .describe('Exact Avstår ballot count; absent when any group ballot lacks its label.'),
     absent: z
       .number()
       .int()
       .nonnegative()
       .optional()
-      .describe('Published Frånvarande count; absent is not zero.'),
+      .describe('Exact Frånvarande ballot count; absent when any group ballot lacks its label.'),
     otherVotes: z.array(otherVoteSchema).describe('Every additional published vote-label count.'),
+    observedVoteLabels: z
+      .array(z.string().describe('A published ballot label.'))
+      .optional()
+      .describe(
+        'Observed labels in an incomplete group; these observations do not establish exact totals.',
+      ),
     avser: z.string().optional().describe('Published subject of this main-vote group.'),
   })
   .describe('One complete party aggregate with no invented counts.');
@@ -137,11 +133,15 @@ export const reportPointSchema = z
       .describe(
         'Published roll-call availability; acclamation requires explicit decision evidence.',
       ),
-    parties: z.array(partyVoteSchema).describe('Every party aggregate returned for this point.'),
+    parties: z
+      .array(partyVoteSchema)
+      .describe(
+        'Every identifiable party/avser aggregate derived from complete published point ballots.',
+      ),
     provenance: z
       .object({
         decisionSourceUrl: z.string().describe('Authoritative report-status source.'),
-        votesSourceUrl: z.string().describe('Fixed-origin grouped main-vote query.'),
+        votesSourceUrl: z.string().describe('Fixed-origin complete ungrouped main-vote query.'),
         upstreamQuery: z
           .string()
           .optional()
@@ -149,12 +149,23 @@ export const reportPointSchema = z
         upstreamWarnings: z
           .array(z.string().describe('A published source warning.'))
           .optional()
-          .describe('Every published warning for this grouped main-vote query.'),
-        retrievedAt: z.string().describe('Grouped-vote source-fetch time.'),
+          .describe('Every published warning for this main-vote query.'),
+        retrievedAt: z.string().describe('Main-vote source-fetch time.'),
       })
-      .describe('Separate authoritative decision and grouped-vote sources.'),
+      .describe('Separate authoritative decision and complete-ballot sources.'),
   })
   .describe('One report point with complete party results and source evidence.');
+
+const sourceSession = (value: string) => parseSourceIdentity(value, normalizeSession);
+const sourceReport = (value: string, session: string) =>
+  parseSourceIdentity(value, (report) => normalizeReport(report, session));
+
+const STANDARD_VOTE_LABELS = new Map<string, 'yes' | 'no' | 'abstain' | 'absent'>([
+  ['Ja', 'yes'],
+  ['Nej', 'no'],
+  ['Avstår', 'abstain'],
+  ['Frånvarande', 'absent'],
+]);
 
 function identityFailure(): never {
   throw new McpError(
@@ -190,41 +201,47 @@ function validateConditions(
 function memberRows(
   root: z.infer<typeof memberList>['voteringlista'],
   session: string,
-  memberId: string,
+  memberId: string | undefined,
   party?: string,
+  selection?: { report: string; point: number; documentId: string },
 ) {
-  validateConditions(
-    root['@villkor'],
-    new Map([
-      ['rm', session],
-      ['iid', memberId],
-    ]),
-  );
-  assertCompleteCandidates(
-    root.votering,
-    root['@antal'],
-    (row) => `${row.votering_id.toUpperCase()}:${row.intressent_id}`,
+  const conditions = new Map([['rm', session]]);
+  if (memberId !== undefined) conditions.set('iid', memberId);
+  if (selection) {
+    conditions.set('bet', selection.report);
+    conditions.set('punkt', String(selection.point));
+  }
+  validateConditions(root['@villkor'], conditions);
+  assertCompleteCandidates(root.votering, root['@antal'], (row) =>
+    JSON.stringify([row.votering_id.toUpperCase(), row.intressent_id, row.avser ?? null]),
   );
   for (const row of root.votering) {
     if (
-      parseSourceIdentity(row.rm, normalizeSession) !== session ||
-      row.intressent_id !== memberId ||
+      sourceSession(row.rm) !== session ||
+      (memberId !== undefined && row.intressent_id !== memberId) ||
       (party !== undefined &&
         row.parti !== undefined &&
         row.parti.toUpperCase() !== party.toUpperCase())
     )
       identityFailure();
-    if (row.punkt !== undefined && row.punkt < 1)
-      throw schemaInvalid('A vote point is not positive.');
+    if (
+      selection &&
+      (row.beteckning === undefined ||
+        sourceReport(row.beteckning, session) !== selection.report ||
+        row.punkt !== selection.point ||
+        row.dok_id === undefined ||
+        parseSourceIdentity(row.dok_id, normalizeDocumentId) !== selection.documentId)
+    )
+      identityFailure();
     if (row.votering_url_xml) sourceUrl(row.votering_url_xml);
   }
   return root.votering
     .map((row) => ({
       voteId: row.votering_id,
       memberId: row.intressent_id,
-      session: parseSourceIdentity(row.rm, normalizeSession),
+      session: sourceSession(row.rm),
       report: row.beteckning,
-      point: row.punkt,
+      ...(row.punkt ? { point: row.punkt } : {}),
       date: row.datum,
       systemDate: row.systemdatum,
       name: row.namn,
@@ -267,6 +284,7 @@ export async function loadMemberVotes(
   const root = loaded.data.voteringlista;
   const candidates = memberRows(root, session, memberId, party);
   const revision = await revisionOf(candidates);
+  const upstreamQuery = queryEcho(root);
   budget.check();
   return {
     rows:
@@ -276,7 +294,7 @@ export async function loadMemberVotes(
     candidateCount: candidates.length,
     revision,
     retrievedAt: loaded.retrievedAt,
-    ...(queryEcho(root) ? { upstreamQuery: queryEcho(root) } : {}),
+    ...(upstreamQuery ? { upstreamQuery } : {}),
     ...(root['@varning'] ? { upstreamWarnings: [root['@varning']] } : {}),
   };
 }
@@ -296,24 +314,18 @@ export async function loadVoteReport(
   const metadata = loaded.record.metadata;
   if (
     !metadata.session ||
-    parseSourceIdentity(metadata.session, normalizeSession) !== session ||
+    sourceSession(metadata.session) !== session ||
     metadata.documentType?.toLowerCase() !== 'bet' ||
-    !metadata.designation ||
-    (report &&
-      parseSourceIdentity(metadata.designation, (value) => normalizeReport(value, session)) !==
-        report)
+    !metadata.designation
   )
     identityFailure();
-  const designation = parseSourceIdentity(metadata.designation, (value) =>
-    normalizeReport(value, session),
-  );
+  const designation = sourceReport(metadata.designation, session);
+  if (report && designation !== report) identityFailure();
   const decisions = [...loaded.record.decisions].sort((a, b) => a.point - b.point);
   for (const decision of decisions) {
     if (
-      (decision.session && parseSourceIdentity(decision.session, normalizeSession) !== session) ||
-      (decision.report &&
-        parseSourceIdentity(decision.report, (value) => normalizeReport(value, session)) !==
-          designation)
+      (decision.session && sourceSession(decision.session) !== session) ||
+      (decision.report && sourceReport(decision.report, session) !== designation)
     )
       identityFailure();
   }
@@ -327,65 +339,105 @@ export async function loadVoteReport(
   return { ...loaded, report: designation, decisions, revision };
 }
 
-function groupedRows(
-  root: z.infer<typeof groupedList>['voteringlista'],
+function pointRows(
+  root: z.infer<typeof memberList>['voteringlista'],
   session: string,
   report: string,
   point: number,
+  documentId: string,
 ) {
-  validateConditions(
-    root['@villkor'],
-    new Map([
-      ['rm', session],
-      ['bet', report],
-      ['punkt', String(point)],
-    ]),
+  return memberRows(root, session, undefined, undefined, { report, point, documentId });
+}
+
+/** Loads every validated published ballot for one authoritative report point. */
+export async function loadPointBallots(
+  service: RiksdagService,
+  session: string,
+  report: string,
+  documentId: string,
+  point: number,
+  budget: ToolBudget,
+) {
+  const query = {
+    rm: session,
+    bet: report,
+    punkt: point,
+    sz: 50000,
+    utformat: 'json',
+  };
+  const loaded = await service.loadJson(
+    {
+      path: '/voteringlista/',
+      query,
+      schema: memberList,
+      ttlMs: 300000,
+      cacheable: (data) => {
+        pointRows(data.voteringlista, session, report, point, documentId);
+        return data.voteringlista.votering.length > 0;
+      },
+    },
+    budget,
   );
-  if (root.votering.length >= 500 || (root['@antal'] !== undefined && root['@antal'] >= 500))
-    throw new McpError(
-      JsonRpcErrorCode.ValidationError,
-      'The grouped vote boundary was reached; complete party groups cannot be returned for this selection.',
-      { reason: 'candidate_limit_reached' },
-    );
-  if (root['@antal'] === undefined || root['@antal'] !== root.votering.length)
-    throw schemaInvalid('The grouped vote count does not match its returned rows.');
-  const seen = new Set<string>();
-  const reserved = new Set(['parti', 'rm', 'bet', 'beteckning', 'punkt', 'avser']);
-  const labels = new Map<string, 'yes' | 'no' | 'abstain' | 'absent'>([
-    ['Ja', 'yes'],
-    ['Nej', 'no'],
-    ['Avstår', 'abstain'],
-    ['Frånvarande', 'absent'],
-  ] as const);
-  return root.votering.map((row) => {
-    if (seen.has(row.parti)) throw schemaInvalid('The grouped response repeats a party.');
-    seen.add(row.parti);
-    if (
-      (row.rm && parseSourceIdentity(row.rm, normalizeSession) !== session) ||
-      ((row.bet ?? row.beteckning) &&
-        parseSourceIdentity(row.bet ?? row.beteckning ?? '', (value) =>
-          normalizeReport(value, session),
-        ) !== report) ||
-      (row.punkt && row.punkt !== String(point))
-    )
-      identityFailure();
-    const counts: { yes?: number; no?: number; abstain?: number; absent?: number } = {};
-    const otherVotes: z.infer<typeof otherVoteSchema>[] = [];
-    for (const [vote, raw] of Object.entries(row)) {
-      if (reserved.has(vote)) continue;
-      const parsed =
-        raw === null || raw === undefined || raw.trim() === ''
-          ? undefined
-          : wireCount.safeParse(raw);
-      if (parsed !== undefined && !parsed.success)
-        throw schemaInvalid('A grouped vote count is not a nonnegative integer.');
-      const count = parsed?.data;
-      const key = labels.get(vote);
-      if (key) {
-        if (count !== undefined) counts[key] = count;
-      } else otherVotes.push({ vote, ...(count === undefined ? {} : { count }) });
+  if (!loaded.found) throw schemaInvalid('The vote list unexpectedly returned a missing response.');
+  const root = loaded.data.voteringlista;
+  const rows = pointRows(root, session, report, point, documentId);
+  const upstreamQuery = queryEcho(root);
+  budget.check();
+  return {
+    rows,
+    retrievedAt: loaded.retrievedAt,
+    sourceUrl: `https://data.riksdagen.se/voteringlista/?${new URLSearchParams(Object.entries(query).map(([key, value]) => [key, String(value)]))}`,
+    ...(upstreamQuery ? { upstreamQuery } : {}),
+    ...(root['@varning'] ? { upstreamWarnings: [root['@varning']] } : {}),
+  };
+}
+
+function aggregateBallots(rows: readonly z.infer<typeof memberVoteSchema>[]) {
+  const groups = new Map<
+    string,
+    { rows: z.infer<typeof memberVoteSchema>[]; party: string; avser?: string }
+  >();
+  for (const row of rows) {
+    // Sparse party identities cannot establish a named party aggregate.
+    if (row.party === undefined) continue;
+    const key = JSON.stringify([row.party, row.avser ?? null]);
+    let group = groups.get(key);
+    if (!group) {
+      group = {
+        rows: [],
+        party: row.party,
+        ...(row.avser === undefined ? {} : { avser: row.avser }),
+      };
+      groups.set(key, group);
     }
-    return { party: row.parti, ...counts, otherVotes, ...(row.avser ? { avser: row.avser } : {}) };
+    group.rows.push(row);
+  }
+  return [...groups.values()].map(({ rows: ballots, party, avser }) => {
+    const complete = ballots.every((row) => row.vote !== undefined);
+    const counts: { yes?: number; no?: number; abstain?: number; absent?: number } = complete
+      ? { yes: 0, no: 0, abstain: 0, absent: 0 }
+      : {};
+    const others = new Map<string, number>();
+    for (const row of ballots) {
+      if (row.vote === undefined) continue;
+      const key = STANDARD_VOTE_LABELS.get(row.vote);
+      if (key) {
+        if (complete) counts[key] = (counts[key] ?? 0) + 1;
+      } else others.set(row.vote, (others.get(row.vote) ?? 0) + 1);
+    }
+    return {
+      party,
+      ...counts,
+      otherVotes: [...others].map(([vote, count]) => ({ vote, ...(complete ? { count } : {}) })),
+      ...(!complete
+        ? {
+            observedVoteLabels: [
+              ...new Set(ballots.flatMap((row) => (row.vote === undefined ? [] : [row.vote]))),
+            ],
+          }
+        : {}),
+      ...(avser === undefined ? {} : { avser }),
+    };
   });
 }
 
@@ -397,35 +449,16 @@ export async function hydrateVotePoint(
   documentId: string,
   decision: z.infer<typeof documentDecisionSchema>,
   budget: ToolBudget,
+  ballots?: Awaited<ReturnType<typeof loadPointBallots>>,
 ) {
-  const query = {
-    rm: session,
-    bet: report,
-    punkt: decision.point,
-    gruppering: 'parti',
-    sz: 500,
-    utformat: 'json',
-  };
-  const loaded = await service.loadJson(
-    {
-      path: '/voteringlista/',
-      query,
-      schema: groupedList,
-      ttlMs: 300000,
-      cacheable: (data) => {
-        groupedRows(data.voteringlista, session, report, decision.point);
-        return data.voteringlista.votering.length > 0;
-      },
-    },
-    budget,
-  );
-  if (!loaded.found) throw schemaInvalid('Grouped votes unexpectedly returned a missing response.');
-  const root = loaded.data.voteringlista;
-  const parties = groupedRows(root, session, report, decision.point);
+  const loaded =
+    ballots ??
+    (await loadPointBallots(service, session, report, documentId, decision.point, budget));
+  const parties = aggregateBallots(loaded.rows);
   const rollCallState =
     decision.decisionType?.toLowerCase() === 'acklamation'
       ? 'acclamation'
-      : parties.length
+      : loaded.rows.length
         ? 'available'
         : decision.decisionType?.toLowerCase() === 'röstning'
           ? 'not_published'
@@ -437,9 +470,9 @@ export async function hydrateVotePoint(
     parties,
     provenance: {
       decisionSourceUrl: `https://data.riksdagen.se/dokumentstatus/${documentId}.json`,
-      votesSourceUrl: `https://data.riksdagen.se/voteringlista/?${new URLSearchParams(Object.entries(query).map(([key, value]) => [key, String(value)]))}`,
-      ...(queryEcho(root) ? { upstreamQuery: queryEcho(root) } : {}),
-      ...(root['@varning'] ? { upstreamWarnings: [root['@varning']] } : {}),
+      votesSourceUrl: loaded.sourceUrl,
+      ...(loaded.upstreamQuery ? { upstreamQuery: loaded.upstreamQuery } : {}),
+      ...(loaded.upstreamWarnings ? { upstreamWarnings: loaded.upstreamWarnings } : {}),
       retrievedAt: loaded.retrievedAt,
     },
   } satisfies z.infer<typeof reportPointSchema>;

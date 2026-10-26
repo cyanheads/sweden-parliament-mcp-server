@@ -9,18 +9,20 @@ import {
 import {
   normalizeCode,
   normalizeDateRange,
+  normalizeMemberId,
   normalizeSession,
   optionalString,
 } from '../../../services/riksdag/normalize.js';
 import {
   effectiveQuery,
   formatExact,
-  measureResponse,
   type SuccessEnrichment,
   successEnrichment,
   successEnrichmentTrailer,
 } from '../../../services/riksdag/output.js';
+import { fitRows } from '../../../services/riksdag/pagination.js';
 import { getRiksdagService } from '../../../services/riksdag/riksdag-service.js';
+import { assertRevision, revisionOf } from '../../../services/riksdag/text.js';
 import { createToolBudget } from '../../../services/riksdag/transport.js';
 
 const argsSchema = z.object({
@@ -38,6 +40,24 @@ const argsSchema = z.object({
     .describe('Parliamentary session; omission searches all available sessions.'),
   committee: z.string().optional().describe('Committee code or exact reference label.'),
   party: z.string().optional().describe('Party code or exact reference label.'),
+  memberId: z
+    .string()
+    .optional()
+    .describe('Numeric member IID from riksdag_search_members; leading zeros are preserved.'),
+  sort: z
+    .enum(['relevance', 'date'])
+    .optional()
+    .describe('Source ordering; relevance for nonblank queries and descending date otherwise.'),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .default(0)
+    .describe('In-page row offset; follow nextCall without changing the remote page size.'),
+  revision: z
+    .string()
+    .optional()
+    .describe('Remote-page revision from continuation; rejects changed pages.'),
   dateFrom: z.string().optional().describe('Inclusive earliest ISO calendar date, YYYY-MM-DD.'),
   dateTo: z.string().optional().describe('Inclusive latest ISO calendar date, YYYY-MM-DD.'),
   page: z.number().int().min(1).default(1).describe('Remote page number, starting at 1.'),
@@ -45,24 +65,29 @@ const argsSchema = z.object({
     .number()
     .int()
     .min(1)
-    .max(10000)
     .default(10)
     .describe('Requested remote page size; maximum applied size 50.'),
 });
-/** Search a source-ranked remote document page without local reranking or page shortening. */
+/** Search source-ranked pages using revision-checked whole-row continuation. */
 export const riksdagSearchDocuments = tool('riksdag_search_documents', {
   title: 'Search parliamentary documents',
   description:
-    'Search Swedish parliamentary documents and consolidated SFS statutes by words, document type, session, committee, party or dates. Read document status and text with riksdag_get_document.',
+    'Search Swedish parliamentary documents and consolidated SFS statutes by words, document type, session, committee, party, member IID or dates. Choose relevance or descending date ordering and follow complete continuation calls. Read document status and text with riksdag_get_document.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: argsSchema,
   output: z.object({
-    items: z.array(documentMetadataSchema).describe('All records in the fetched remote page.'),
+    items: z
+      .array(documentMetadataSchema)
+      .describe('Complete rows selected from the fetched remote page.'),
     page: z.number().describe('Applied remote page.'),
     pageSize: z.number().describe('Applied remote page size.'),
     returnedCount: z.number().describe('Actual rows returned.'),
+    offset: z.number().describe('Applied in-page row offset.'),
+    remoteReturnedCount: z.number().describe('Complete fetched remote-page row count.'),
+    revision: z.string().describe('Hash of the complete normalized remote page.'),
+    truncated: z.boolean().describe('Whether response fitting shortened this local page.'),
     totalCount: z.number().optional().describe('Authoritative source hit count, when published.'),
-    hasMore: z.boolean().describe('Whether another remote page is indicated.'),
+    hasMore: z.boolean().describe('Whether local rows or another remote page remain.'),
     nextCall: z
       .object({
         toolName: z.literal('riksdag_search_documents').describe('Tool to call next.'),
@@ -74,6 +99,14 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
   enrichment: successEnrichment,
   enrichmentTrailer: successEnrichmentTrailer,
   errors: [
+    {
+      reason: 'revision_changed',
+      code: JsonRpcErrorCode.Conflict,
+      when: 'The remote page changed between continuation calls.',
+      recovery:
+        'Restart this page at offset zero without revision to read one consistent remote page.',
+      thrownBy: 'service',
+    },
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
@@ -120,20 +153,25 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
       session = optionalString(input.session),
       committee = optionalString(input.committee),
       party = optionalString(input.party);
+    const memberId = optionalString(input.memberId);
     const filters: DocumentSearchFilters = {
       ...(query ? { query } : {}),
       ...(dt ? { documentType: normalizeCode(dt, 'document_types') } : {}),
       ...(session ? { session: normalizeSession(session) } : {}),
       ...(committee ? { committee: normalizeCode(committee, 'committees') } : {}),
       ...(party ? { party: normalizeCode(party, 'parties') } : {}),
+      ...(memberId ? { memberId: normalizeMemberId(memberId) } : {}),
+      sort: input.sort ?? (query ? 'relevance' : 'date'),
       ...normalizeDateRange(input.dateFrom, input.dateTo),
       page: input.page,
       pageSize: Math.min(input.pageSize, 50),
     };
     const result = await searchDocuments(getRiksdagService(), filters, budget);
     const { retrievedAt, upstreamQuery, upstreamWarnings, ...domain } = result;
+    const revision = await revisionOf(domain);
+    assertRevision(optionalString(input.revision), revision);
     const enrichment: SuccessEnrichment = {
-      effectiveQuery: effectiveQuery(filters),
+      effectiveQuery: effectiveQuery({ ...filters, offset: input.offset, revision }),
       source: 'Source: The Swedish Parliament',
       retrievedAt,
       notices: [],
@@ -147,21 +185,42 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
           ? 'No documents were returned on this page. Retry page: 1 with unchanged filters.'
           : 'No documents matched the applied filters. Use riksdag_list_reference with topic document_types or sessions, then retry riksdag_search_documents with fewer filters.',
       );
-    const output = {
-      ...domain,
-      ...(domain.hasMore
-        ? {
-            nextCall: {
-              toolName: 'riksdag_search_documents' as const,
-              args: { ...filters, page: filters.page + 1 },
-            },
-          }
-        : {}),
-    };
-    if (measureResponse(output, enrichment) > 24576)
+    if (input.offset > domain.items.length)
       enrichment.notices.push(
-        'This remote page exceeds the response target and is returned intact. Restart at page 1 with a smaller pageSize.',
+        'The in-page offset is beyond the available rows; this is an empty terminal page.',
       );
+    const output = fitRows({
+      rows: domain.items,
+      offset: input.offset,
+      limit: filters.pageSize,
+      enrichment,
+      budget,
+      build: (items, _limit, truncated) => {
+        const nextOffset = input.offset + items.length;
+        const localMore = nextOffset < domain.items.length;
+        const hasMore = localMore || (nextOffset <= domain.items.length && domain.hasMore);
+        return {
+          ...domain,
+          items,
+          returnedCount: items.length,
+          remoteReturnedCount: domain.items.length,
+          offset: input.offset,
+          revision,
+          truncated,
+          hasMore,
+          ...(hasMore
+            ? {
+                nextCall: {
+                  toolName: 'riksdag_search_documents' as const,
+                  args: localMore
+                    ? { ...filters, offset: nextOffset, revision }
+                    : { ...filters, page: filters.page + 1, offset: 0 },
+                },
+              }
+            : {}),
+        };
+      },
+    });
     budget.check();
     ctx.enrich(enrichment);
     return output;

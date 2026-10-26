@@ -9,6 +9,25 @@ afterEach(() => getRiksdagService().dispose());
 
 describe('speech input contract', () => {
   it.each([
+    [{}, ['session']],
+    [
+      { mode: 'get', session: '2024/25', limit: 5, textCount: 1 },
+      ['speechId', 'session', 'limit', 'textCount'],
+    ],
+    [
+      { session: '2024/25', speechId: 'HC091-1', textOffset: 0, textLength: 1 },
+      ['speechId', 'textOffset', 'textLength'],
+    ],
+  ] as const)('names missing and conflicting mode fields for %j', async (input, fields) => {
+    const network = vi.fn<typeof fetch>();
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagSearchSpeeches, input);
+    expect(result.isError).toBe(true);
+    const rendered = JSON.stringify(result);
+    for (const field of fields) expect(rendered).toContain(field);
+    expect(network).not.toHaveBeenCalled();
+  });
+  it.each([
     {},
     { session: '' },
     { session: '2024/25', speechId: 'HC091-1' },

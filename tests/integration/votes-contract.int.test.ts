@@ -119,7 +119,7 @@ describe('vote public contracts', () => {
     });
     expect(JSON.stringify(domain)).not.toContain('private@example.test');
   });
-  it.each(['metadata', 'grouped-echo'])(
+  it.each(['metadata', 'ballot-echo'])(
     'returns %s identity mismatch and recovery through both surfaces',
     async (kind) => {
       const network: typeof fetch =
@@ -266,7 +266,7 @@ describe('vote public contracts', () => {
       'revision_changed',
     );
   });
-  it('keeps one total deadline across report loading and grouped hydration', async () => {
+  it('keeps one total deadline across report loading and ballot hydration', async () => {
     vi.useFakeTimers();
     const hydrationStarted = Promise.withResolvers<void>();
     const network = vi.fn<typeof fetch>().mockImplementation(async (request) => {
@@ -300,7 +300,7 @@ describe('vote public contracts', () => {
     );
     expect(network).toHaveBeenCalledTimes(2);
   });
-  it('cancels grouped body consumption instead of returning partially hydrated points', async () => {
+  it('cancels ballot body consumption instead of returning partially hydrated points', async () => {
     const caller = new AbortController();
     const ready = Promise.withResolvers<void>();
     const cancelled = vi.fn();
@@ -383,11 +383,14 @@ describe('vote public contracts', () => {
           ...(point === 4
             ? {
                 votering: {
+                  votering_id: 'v1',
+                  intressent_id: '0001',
+                  rm: '2024/25',
+                  beteckning: 'KU1',
+                  punkt: '4',
+                  dok_id: 'HC01KU1',
                   parti: 'S',
-                  Ja: '0',
-                  Nej: '',
-                  Avstår: '2',
-                  Annan: '',
+                  rost: undefined,
                   avser: 'motivering',
                 },
               }
@@ -419,12 +422,12 @@ describe('vote public contracts', () => {
       'available',
     ]);
     expect(domain.points?.[3]?.parties).toEqual([
-      { party: 'S', yes: 0, abstain: 2, otherVotes: [{ vote: 'Annan' }], avser: 'motivering' },
+      { party: 'S', otherVotes: [], observedVoteLabels: [], avser: 'motivering' },
     ]);
     expect(enrichment.notices.join(' ')).toContain('remain unknown, not zero');
     expect(network).toHaveBeenCalledTimes(6);
   });
-  it.each([10, 11])(
+  it.each([10, 11, 100000])(
     'traverses all report points with pointLimit %i and stable revision',
     async (pointLimit) => {
       initRiksdagService({ fetch: reportFetch(undefined, 12) });
@@ -442,7 +445,7 @@ describe('vote public contracts', () => {
         expect(domain.pointLimit).toBeLessThanOrEqual(10);
         if (!points.length)
           expect(enrichment.notices.some((notice) => notice.includes('clamped'))).toBe(
-            pointLimit === 11,
+            pointLimit > 10,
           );
         revision ??= domain.revision;
         expect(domain.revision).toBe(revision);
@@ -465,8 +468,20 @@ describe('vote public contracts', () => {
   it('preserves an already hydrated oversized point and continues after it', async () => {
     const network = vi.fn<typeof fetch>().mockImplementation(
       reportFetch(
-        () => ({
-          voteringlista: { '@antal': '1', votering: { parti: 'x'.repeat(16000), Ja: '0' } },
+        (point) => ({
+          voteringlista: {
+            '@antal': '1',
+            votering: {
+              votering_id: 'v1',
+              intressent_id: '0001',
+              rm: '2024/25',
+              beteckning: 'KU1',
+              punkt: String(point),
+              dok_id: 'HC01KU1',
+              parti: 'x'.repeat(16000),
+              rost: 'Nej',
+            },
+          },
         }),
         3,
       ),
@@ -564,7 +579,7 @@ describe('vote public contracts', () => {
     expect(terminal.enrichment.notices.join(' ')).toContain('beyond');
     expect(network).toHaveBeenCalledTimes(2);
   });
-  it.each(['member', 'grouped'] as const)(
+  it.each(['member', 'point'] as const)(
     'rejects exact %s saturation before returning a prefix',
     async (mode) => {
       const network: typeof fetch =
@@ -582,8 +597,17 @@ describe('vote public contracts', () => {
               })
           : reportFetch(() => ({
               voteringlista: {
-                '@antal': '500',
-                votering: Array.from({ length: 500 }, (_, i) => ({ parti: `P${i}`, Ja: '0' })),
+                '@antal': '50000',
+                votering: Array.from({ length: 50000 }, (_, i) => ({
+                  votering_id: `v${i}`,
+                  intressent_id: '0001',
+                  rm: '2024/25',
+                  beteckning: 'KU1',
+                  punkt: '1',
+                  dok_id: 'HC01KU1',
+                  parti: 'S',
+                  rost: 'Ja',
+                })),
               },
             }));
       initRiksdagService({ fetch: network });
@@ -598,7 +622,7 @@ describe('vote public contracts', () => {
       );
     },
   );
-  it.each([500, 501])(
+  it.each([500, 501, 100000])(
     'traverses measured member pages requested at %i without missing or repeating a whole vote',
     async (limit) => {
       const rows = memberVoteRows(505);
@@ -628,9 +652,7 @@ describe('vote public contracts', () => {
           requestedLimit: args.limit,
         });
         if (!ids.length)
-          expect(enrichment.notices.some((notice) => notice.includes('clamped'))).toBe(
-            limit === 501,
-          );
+          expect(enrichment.notices.some((notice) => notice.includes('clamped'))).toBe(limit > 500);
         revision ??= domain.revision;
         expect(domain.revision).toBe(revision);
         ids.push(...(domain.votes ?? []).map((row) => row.voteId));

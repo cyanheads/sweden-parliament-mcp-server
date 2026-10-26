@@ -1,7 +1,12 @@
 /** @fileoverview Measured whole-entry and Unicode text continuation. @module tests/services/riksdag/pagination */
 import { describe, expect, it } from 'vitest';
 import { measureResponse, type SuccessEnrichment } from '@/services/riksdag/output.js';
-import { fitRows, fitText, RESPONSE_TARGET_BYTES } from '@/services/riksdag/pagination.js';
+import {
+  fitRows,
+  fitText,
+  fitTextPages,
+  RESPONSE_TARGET_BYTES,
+} from '@/services/riksdag/pagination.js';
 
 const enrichment = (): SuccessEnrichment => ({
   effectiveQuery: '{}',
@@ -10,6 +15,17 @@ const enrichment = (): SuccessEnrichment => ({
   notices: [],
 });
 describe('response fitting', () => {
+  it('starts omitted text pages at 8000 code points when the full envelope fits', () => {
+    const context = enrichment();
+    const page = fitText({
+      text: 'a'.repeat(9000),
+      offset: 0,
+      enrichment: context,
+      build: (text, length) => ({ text, length }),
+    });
+    expect(page).toEqual({ text: 'a'.repeat(8000), length: 8000 });
+    expect(measureResponse(page, context)).toBeLessThanOrEqual(RESPONSE_TARGET_BYTES);
+  });
   it('keeps rows whole and advances complete continuation by actual shown rows', () => {
     const context = enrichment();
     const rows = Array.from({ length: 20 }, (_, id) => ({ id, text: 'å'.repeat(1200) }));
@@ -94,5 +110,43 @@ describe('response fitting', () => {
       }),
     ).toEqual({ text: '', length: 0 });
     expect(context.notices.join(' ')).toContain('beyond');
+  });
+  it('jointly fits defaults around explicit text and preserves empty and oversized metadata', () => {
+    const context = enrichment();
+    const page = fitTextPages({
+      sources: [
+        { text: 'a'.repeat(9000), offset: 0, length: 3000 },
+        { text: '😀'.repeat(9000), offset: 0 },
+      ],
+      enrichment: context,
+      build: (pages) => ({
+        pages: pages.map(({ text, returnedLength }) => ({ text, returnedLength })),
+      }),
+    });
+    expect(page.pages[0]).toEqual({ text: 'a'.repeat(3000), returnedLength: 3000 });
+    expect(page.pages[1]!.returnedLength).toBeGreaterThan(0);
+    expect(page.pages[1]!.returnedLength).toBeLessThan(8000);
+    expect(measureResponse(page, context)).toBeLessThanOrEqual(RESPONSE_TARGET_BYTES);
+    expect(
+      fitTextPages({
+        sources: [],
+        enrichment: enrichment(),
+        build: (pages) => ({
+          pages: pages.map(({ text, returnedLength }) => ({ text, returnedLength })),
+        }),
+      }),
+    ).toEqual({ pages: [] });
+    const oversizedContext = enrichment();
+    const oversized = fitTextPages({
+      sources: [{ text: 'abc', offset: 0 }],
+      enrichment: oversizedContext,
+      build: (pages) => ({
+        metadata: 'z'.repeat(30000),
+        pages: pages.map(({ text, returnedLength }) => ({ text, returnedLength })),
+      }),
+    });
+    expect(oversized.metadata).toHaveLength(30000);
+    expect(oversized.pages).toEqual([{ text: 'a', returnedLength: 1 }]);
+    expect(oversizedContext.notices.join(' ')).toContain('metadata');
   });
 });

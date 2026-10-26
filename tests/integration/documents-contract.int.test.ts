@@ -5,7 +5,8 @@ import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { riksdagGetDocument } from '@/mcp-server/tools/definitions/get-document.tool.js';
 import { riksdagSearchDocuments } from '@/mcp-server/tools/definitions/search-documents.tool.js';
-import { successEnrichment } from '@/services/riksdag/output.js';
+import { measureResponse, successEnrichment } from '@/services/riksdag/output.js';
+import { RESPONSE_TARGET_BYTES } from '@/services/riksdag/pagination.js';
 import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksdag-service.js';
 import { reportFixture } from '../services/riksdag/document-fixtures.js';
 
@@ -40,6 +41,93 @@ function assertSuccess(result: Awaited<ReturnType<typeof runToolContract>>) {
 }
 
 describe('document public contract', () => {
+  it('fits combined default text and HTML after all selected section metadata', async () => {
+    const fixture = reportFixture(3);
+    fixture.dokumentstatus.dokument.html = `<p>${'å😀\\"\n'.repeat(4000)}</p>`;
+    initRiksdagService({ fetch: async () => Response.json(fixture) });
+    const result = await runToolContract(riksdagGetDocument, {
+      documentId: 'HC01KU1',
+      sections: ['metadata', 'activities', 'reservations', 'text', 'source_html'],
+    });
+    const enrichment = assertSuccess(result);
+    const page = riksdagGetDocument.output.parse(result.structuredContent);
+    expect(domainText(result)).toEqual(page);
+    expect(page.activities).toHaveLength(3);
+    expect(page.reservations).toHaveLength(3);
+    expect(page.textReturnedLength).toBeGreaterThan(0);
+    expect(page.htmlReturnedLength).toBeGreaterThan(0);
+    expect(measureResponse(page, enrichment)).toBeLessThanOrEqual(RESPONSE_TARGET_BYTES);
+  });
+  it('normalizes blank revisions and emits one terminal notice per requested representation', async () => {
+    initRiksdagService({ fetch: async () => Response.json(reportFixture()) });
+    const result = await runToolContract(riksdagGetDocument, {
+      documentId: 'HC01KU1',
+      sections: ['text', 'source_html'],
+      revision: '  ',
+      textOffset: 10000,
+      htmlOffset: 10000,
+    });
+    const enrichment = assertSuccess(result);
+    const page = riksdagGetDocument.output.parse(result.structuredContent);
+    expect(domainText(result)).toEqual(page);
+    expect(JSON.parse(enrichment.effectiveQuery)).not.toHaveProperty('revision');
+    expect(enrichment.notices.filter((notice) => notice.includes('beyond'))).toHaveLength(2);
+    expect(page).toMatchObject({
+      text: '',
+      sourceHtml: '',
+      textHasMore: false,
+      htmlHasMore: false,
+    });
+  });
+  it('fits selected arrays together with the text envelope and keeps independent continuations', async () => {
+    const fixture = reportFixture(8);
+    for (const row of fixture.dokumentstatus.dokaktivitet.aktivitet) row.namn = 'a'.repeat(900);
+    for (const row of fixture.dokumentstatus.dokmotforslag.motforslag) row.rubrik = 'b'.repeat(900);
+    fixture.dokumentstatus.dokument.html = `<p>${'😀'.repeat(9000)}</p>`;
+    initRiksdagService({ fetch: async () => Response.json(fixture) });
+    const result = await runToolContract(riksdagGetDocument, {
+      documentId: 'HC01KU1',
+      sections: ['activities', 'reservations', 'text', 'source_html'],
+      sectionLimit: 8,
+    });
+    const enrichment = assertSuccess(result);
+    const page = riksdagGetDocument.output.parse(result.structuredContent);
+    expect(domainText(result)).toEqual(page);
+    expect(measureResponse(page, enrichment)).toBeLessThanOrEqual(RESPONSE_TARGET_BYTES);
+    for (const section of ['activities', 'reservations'] as const) {
+      const pagination = page.sectionPages?.find((entry) => entry.section === section);
+      expect(pagination?.nextCall?.args.sectionOffset).toBe(page[section]?.length);
+      expect(pagination?.nextCall?.args.sections).toEqual([section]);
+    }
+  });
+  it('reconstructs both default representations after a combined first page with stable revisions', async () => {
+    const body = 'Å😀x'.repeat(5000);
+    const html = `<p>${body}</p>`;
+    const fixture = reportFixture(1);
+    fixture.dokumentstatus.dokument.html = html;
+    initRiksdagService({ fetch: async () => Response.json(fixture) });
+    const firstResult = await runToolContract(riksdagGetDocument, {
+      documentId: 'HC01KU1',
+      sections: ['text', 'source_html'],
+    });
+    const first = riksdagGetDocument.output.parse(firstResult.structuredContent);
+    for (const channel of ['text', 'source_html'] as const) {
+      let combined = channel === 'text' ? first.text! : first.sourceHtml!;
+      let next = channel === 'text' ? first.nextTextCall : first.nextHtmlCall;
+      while (next) {
+        expect(next.args.revision).toBe(first.revision);
+        expect(next.args.sections).toEqual([channel]);
+        const result = await runToolContract(riksdagGetDocument, next.args);
+        const context = assertSuccess(result);
+        const page = riksdagGetDocument.output.parse(result.structuredContent);
+        expect(domainText(result)).toEqual(page);
+        expect(measureResponse(page, context)).toBeLessThanOrEqual(RESPONSE_TARGET_BYTES);
+        combined += channel === 'text' ? page.text : page.sourceHtml;
+        next = channel === 'text' ? page.nextTextCall : page.nextHtmlCall;
+      }
+      expect(combined).toBe(channel === 'text' ? body : html);
+    }
+  });
   it('returns classified upstream outage instead of a successful missing document', async () => {
     vi.useFakeTimers();
     const network = vi
@@ -201,14 +289,14 @@ describe('document public contract', () => {
       documentId: '2000:100',
       sections: ['text', 'activities'],
       textLength: 12000,
-      sectionLimit: 101,
+      sectionLimit: 100000,
     });
     const enrichment = assertSuccess(result);
     expect(result.structuredContent).toMatchObject({
       text,
       textReturnedLength: 12000,
       textHasMore: false,
-      sectionPages: [{ limit: 100, requestedLimit: 101 }],
+      sectionPages: [{ limit: 100, requestedLimit: 100000 }],
     });
     expect(enrichment.notices.join(' ')).toContain('explicit textLength');
     expect(enrichment.notices.join(' ')).toContain('clamped to 100');
@@ -260,10 +348,12 @@ describe('document public contract', () => {
         dateTo: '2000-12-31',
         page: 2,
         pageSize: 2,
+        offset: 0,
+        sort: 'relevance',
       },
     });
     expect(String(network.mock.calls[0]?.[0])).toBe(
-      'https://data.riksdagen.se/dokumentlista/?doktyp=bet&from=1999-01-01&org=KU&p=1&parti=S&rm=1999%2F2000&sok=budget&sz=2&tom=2000-12-31&utformat=json',
+      'https://data.riksdagen.se/dokumentlista/?doktyp=bet&from=1999-01-01&org=KU&p=1&parti=S&rm=1999%2F2000&sok=budget&sort=rel&sortorder=desc&sz=2&tom=2000-12-31&utformat=json',
     );
     expect(network).toHaveBeenCalledTimes(1);
   });
@@ -288,7 +378,7 @@ describe('document public contract', () => {
       riksdagSearchDocuments.output.parse(result.structuredContent),
     );
     expect(String(network.mock.calls[0]?.[0])).toBe(
-      'https://data.riksdagen.se/dokumentlista/?p=1&sz=10&utformat=json',
+      'https://data.riksdagen.se/dokumentlista/?p=1&sort=datum&sortorder=desc&sz=10&utformat=json',
     );
     expect(result.structuredContent).toMatchObject({ items: [{ documentId: 'HC01KU1' }] });
     expect(domainText(result)).not.toHaveProperty('items.0.publicationStatus');
@@ -313,7 +403,7 @@ describe('document public contract', () => {
       );
     },
   );
-  it('returns an oversized remote page intact with unchanged page size and complete continuation', async () => {
+  it('returns an oversized row intact and continues within the unchanged remote page', async () => {
     const title = 'å'.repeat(8000);
     initRiksdagService({
       fetch: async () =>
@@ -331,15 +421,15 @@ describe('document public contract', () => {
     const enrichment = assertSuccess(result);
     const page = riksdagSearchDocuments.output.parse(result.structuredContent);
     expect(page).toMatchObject({
-      returnedCount: 2,
+      returnedCount: 1,
       pageSize: 2,
-      items: [{ title }, { title }],
-      nextCall: { args: { page: 2, pageSize: 2 } },
+      items: [{ title }],
+      nextCall: { args: { page: 1, pageSize: 2, offset: 1, revision: page.revision } },
     });
     expect(domainText(result)).toEqual(page);
     expect(enrichment.notices.join(' ')).toContain('returned intact');
   });
-  it('clamps remote page size explicitly without shortening the fetched 50 rows', async () => {
+  it('clamps remote page size and retains every fetched row across local continuations', async () => {
     initRiksdagService({
       fetch: async () =>
         Response.json({
@@ -349,13 +439,22 @@ describe('document public contract', () => {
           },
         }),
     });
-    const result = await runToolContract(riksdagSearchDocuments, { pageSize: 101 });
+    const result = await runToolContract(riksdagSearchDocuments, { pageSize: 100000 });
     expect(assertSuccess(result).notices.join(' ')).toContain('clamped to 50');
-    expect(result.structuredContent).toMatchObject({
-      pageSize: 50,
-      returnedCount: 50,
-      hasMore: false,
-    });
+    const first = riksdagSearchDocuments.output.parse(result.structuredContent);
+    expect(first.pageSize).toBe(50);
+    expect(first.remoteReturnedCount).toBe(50);
+    const ids = first.items.map((row) => row.documentId);
+    let next = first.nextCall;
+    while (next) {
+      expect(next.args).toMatchObject({ page: 1, pageSize: 50, revision: first.revision });
+      const continued = await runToolContract(riksdagSearchDocuments, next.args);
+      const page = riksdagSearchDocuments.output.parse(continued.structuredContent);
+      expect(domainText(continued)).toEqual(page);
+      ids.push(...page.items.map((row) => row.documentId));
+      next = page.nextCall;
+    }
+    expect(ids).toEqual(Array.from({ length: 50 }, (_, i) => `HC01KU${i + 1}`));
     expect(domainText(result)).toEqual(
       riksdagSearchDocuments.output.parse(result.structuredContent),
     );

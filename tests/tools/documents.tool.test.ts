@@ -7,14 +7,14 @@ import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksda
 
 describe('document tool boundaries', () => {
   it('applies economical defaults without interpreting a bare report as an ID', () => {
-    expect(riksdagSearchDocuments.input.parse({})).toEqual({ page: 1, pageSize: 10 });
+    expect(riksdagSearchDocuments.input.parse({})).toEqual({ page: 1, pageSize: 10, offset: 0 });
     expect(riksdagGetDocument.input.parse({ documentId: 'HC01KU1' })).toMatchObject({
       textOffset: 0,
       htmlOffset: 0,
       sectionOffset: 0,
       sectionLimit: 20,
     });
-    for (const input of [{ page: 0 }, { pageSize: 10001 }, { page: 1.5 }])
+    for (const input of [{ page: 0 }, { pageSize: 0 }, { page: 1.5 }])
       expect(riksdagSearchDocuments.input.safeParse(input).success).toBe(false);
     for (const input of [
       { documentId: '' },

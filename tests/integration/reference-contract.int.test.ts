@@ -22,13 +22,13 @@ describe('reference public response contract', () => {
     const result = await runToolContract(listReference, {
       topic: 'sessions',
       offset: 0,
-      limit: 101,
+      limit: 100000,
     });
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toMatchObject({
       topic: 'sessions',
       offset: 0,
-      requestedLimit: 101,
+      requestedLimit: 100000,
       source: 'Source: The Swedish Parliament',
       retrievedAt: '2026-10-25',
       referenceVerifiedAt: '2026-10-25',

@@ -52,7 +52,7 @@ describe('vote mode contracts', () => {
       { mode: 'report' },
       { session: '2024/25' },
       { mode: 'report', session: '2024/25', point: 0 },
-      { mode: 'member', session: '2024/25', limit: 10001 },
+      { mode: 'member', session: '2024/25', limit: 0 },
       { mode: 'report', session: '2024/25', pointOffset: -1 },
     ])
       expect(riksdagGetVotes.input.safeParse(args).success).toBe(false);

@@ -4,7 +4,8 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { riksdagSearchSpeeches } from '@/mcp-server/tools/definitions/search-speeches.tool.js';
-import { successEnrichment } from '@/services/riksdag/output.js';
+import { measureResponse, successEnrichment } from '@/services/riksdag/output.js';
+import { RESPONSE_TARGET_BYTES } from '@/services/riksdag/pagination.js';
 import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksdag-service.js';
 import { speechList, speechRow } from '../services/riksdag/speech-fixtures.js';
 
@@ -41,6 +42,59 @@ function success(result: Awaited<ReturnType<typeof runToolContract>>) {
 }
 
 describe('speech public contract', () => {
+  it('fits hydrated text against the final multi-item envelope without dropping metadata rows', async () => {
+    const body = 'Å😀x'.repeat(5000);
+    initRiksdagService({
+      fetch: async (url) => {
+        if (String(url).includes('anforandelista')) return Response.json(speechList(5));
+        const number = Number(new URL(String(url)).pathname.split('-').at(-1)?.split('.')[0]);
+        return Response.json({
+          anforande: { ...speechRow(number), anforandetext: `<p>${body}</p>` },
+        });
+      },
+    });
+    const result = await runToolContract(riksdagSearchSpeeches, {
+      session: '2024/25',
+      textCount: 5,
+      limit: 5,
+    });
+    const page = success(result);
+    const enrichment = z.object(successEnrichment).parse(result.structuredContent);
+    expect(page.items).toHaveLength(5);
+    expect(
+      page.items?.every((item) => item.textState === 'included' && item.textReturnedLength! > 0),
+    ).toBe(true);
+    expect(measureResponse(page, enrichment)).toBeLessThanOrEqual(RESPONSE_TARGET_BYTES);
+    const first = page.items![0]!;
+    let combined = first.text!;
+    let next = first.nextTextCall;
+    while (next) {
+      expect(next.args.revision).toBe(first.textRevision);
+      const result = await runToolContract(riksdagSearchSpeeches, next.args);
+      const continued = success(result);
+      expect(
+        measureResponse(continued, z.object(successEnrichment).parse(result.structuredContent)),
+      ).toBeLessThanOrEqual(RESPONSE_TARGET_BYTES);
+      combined += continued.item!.text;
+      next = continued.item!.nextTextCall;
+    }
+    expect(combined).toBe(body);
+  });
+  it('returns zero-byte detail misses on get and hydrated search surfaces without caching misses', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (url) =>
+        String(url).includes('anforandelista') ? Response.json(speechList(1)) : new Response(''),
+      );
+    initRiksdagService({ fetch: network });
+    expect(
+      success(await runToolContract(riksdagSearchSpeeches, { mode: 'get', speechId: 'HC091-1' })),
+    ).toMatchObject({ found: false, guidance: expect.any(String) });
+    expect(
+      success(await runToolContract(riksdagSearchSpeeches, { session: '2024/25' })),
+    ).toMatchObject({ items: [{ textState: 'unavailable' }] });
+    expect(network).toHaveBeenCalledTimes(3);
+  });
   it('retains CRLF text bytes on both surfaces and renders source links as usable Markdown', async () => {
     initRiksdagService({
       fetch: async () =>
@@ -388,7 +442,8 @@ describe('speech public contract', () => {
     const defaultPage = success(
       await runToolContract(riksdagSearchSpeeches, { mode: 'get', speechId: 'HC091-1' }),
     );
-    expect(defaultPage.item).toMatchObject({ textReturnedLength: 1000, textHasMore: true });
+    expect(defaultPage.item?.textReturnedLength).toBeGreaterThan(1000);
+    expect(defaultPage.item?.textHasMore).toBe(true);
     const large = success(
       await runToolContract(riksdagSearchSpeeches, {
         mode: 'get',

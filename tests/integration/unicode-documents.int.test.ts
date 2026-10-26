@@ -27,11 +27,28 @@ describe('Swedish document identifiers', () => {
       fetch: async () =>
         Response.json({ dokumentlista: { '@traffar': '50', '@sida': '1', dokument: rows } }),
     });
-    const result = await runToolContract(riksdagSearchDocuments, {
+    const first = await runToolContract(riksdagSearchDocuments, {
       session: '2024/25',
       documentType: 'bet',
       pageSize: 50,
     });
+    const firstPage = riksdagSearchDocuments.output.parse(first.structuredContent);
+    const items = [...firstPage.items];
+    const content = [...first.content];
+    let next = firstPage.nextCall;
+    while (next) {
+      const continued = await runToolContract(riksdagSearchDocuments, next.args);
+      expect(continued.isError).not.toBe(true);
+      const page = riksdagSearchDocuments.output.parse(continued.structuredContent);
+      items.push(...page.items);
+      content.push(...continued.content);
+      next = page.nextCall;
+    }
+    const result = {
+      ...first,
+      content,
+      structuredContent: { ...firstPage, items, returnedCount: items.length },
+    };
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toMatchObject({
       returnedCount: 50,

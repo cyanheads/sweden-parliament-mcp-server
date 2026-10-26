@@ -9,6 +9,9 @@ interface Entry {
   sizeBytes: number;
 }
 
+const MAX_ENTRIES = 64;
+const MAX_BYTES = 32 * 1024 * 1024;
+
 /** Stores only serialized successes so callers cannot mutate cached values. */
 export class PublicResponseCache {
   readonly #entries = new Map<string, Entry>();
@@ -32,11 +35,11 @@ export class PublicResponseCache {
     const prior = this.#entries.get(key);
     if (prior) this.#delete(key, prior);
     const sizeBytes = new TextEncoder().encode(serialized).byteLength;
-    if (sizeBytes > 32 * 1024 * 1024) return;
+    if (sizeBytes > MAX_BYTES) return;
     for (const [oldKey, entry] of this.#entries) {
       if (entry.expiresAt <= Date.now()) this.#delete(oldKey, entry);
     }
-    while (this.#entries.size >= 64 || this.#sizeBytes + sizeBytes > 32 * 1024 * 1024) {
+    while (this.#entries.size >= MAX_ENTRIES || this.#sizeBytes + sizeBytes > MAX_BYTES) {
       const oldest = this.#entries.entries().next().value;
       if (!oldest) break;
       this.#delete(oldest[0], oldest[1]);
