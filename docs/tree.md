@@ -1,6 +1,6 @@
 # sweden-parliament-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 03:51:02
+Generated on: 2026-11-16 01:33:05
 
 ```text
 sweden-parliament-mcp-server/
@@ -135,6 +135,9 @@ sweden-parliament-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── sweden-parliament-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── mcp-server/
 │   │   ├── prompts/
@@ -184,11 +187,14 @@ sweden-parliament-mcp-server/
 │   ├── services/
 │   │   └── riksdag/
 │   │       ├── cache-wire.test.ts
+│   │       ├── continuation-fixtures.ts
 │   │       ├── document-evolution.test.ts
 │   │       ├── document-fixtures.ts
 │   │       ├── documents.test.ts
 │   │       ├── member-fixtures.ts
 │   │       ├── members.test.ts
+│   │       ├── normalize-pattern-timing.test.ts
+│   │       ├── normalize-patterns.test.ts
 │   │       ├── normalize.test.ts
 │   │       ├── pagination-timing.test.ts
 │   │       ├── pagination.test.ts
@@ -207,6 +213,7 @@ sweden-parliament-mcp-server/
 │       ├── members.tool.test.ts
 │       ├── output-ceilings.tool.test.ts
 │       ├── report-ballots.tool.test.ts
+│       ├── schema-weight.test.ts
 │       ├── speeches.tool.test.ts
 │       └── votes.tool.test.ts
 ├── .dockerignore
@@ -219,6 +226,7 @@ sweden-parliament-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile

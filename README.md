@@ -40,8 +40,8 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 | `riksdag_list_reference` | Browse official document types, committees, parties, constituencies, sessions, and identifier and coverage guidance |
 | `riksdag_search_documents` | Search parliamentary documents and consolidated SFS statutes by words, type, session, committee, party, member, or dates |
 | `riksdag_get_document` | Read publication metadata, decisions, reservations, activities, links, and paginated text |
-| `riksdag_search_speeches` | Find speeches within a session by debate heading, member, or party; retrieve full text through get mode |
-| `riksdag_get_votes` | Read report decisions, party main-vote totals, individual ballots for a point, or one member's session main votes |
+| `riksdag_search_speeches` | Find speeches within a session by debate heading, member, party, or related document; retrieve full text through get mode |
+| `riksdag_get_votes` | Read report decisions, party main-vote totals, individual ballots for a point, or one member's session main votes, optionally narrowed to a report or point |
 | `riksdag_search_members` | Find register entries by name, party, constituency, and source service classification |
 | `riksdag_get_member` | Read an exact member IID and its published assignment history |
 
@@ -60,15 +60,16 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 
 - Optional `query`, `documentType`, `session`, `committee`, `party`, `memberId`, `dateFrom`, and `dateTo`; dates use `YYYY-MM-DD`, and codes or exact reference labels are accepted. `memberId` selects source-linked participants, without inferring authorship
 - `sort` is `relevance` for a nonblank query and `date` otherwise; either can be selected explicitly. Source subtitles include available author and SFS consolidation labels
-- Remote `page` starts at 1; `pageSize` defaults to 10 and is clamped to 50. Large pages split into whole-row responses with `offset` and `revision`; follow `nextCall` to finish that remote page before advancing, keeping `pageSize` fixed
-- Use `documentType: "sfs"` for consolidated statutes; narrow slow full-text searches with `session` or `documentType`
+- Remote `page` starts at 1; `pageSize` defaults to 10 and is clamped to 50. A call returns the whole fetched remote page and `nextCall` advances `page`; the `offset` and `revision` inputs still resolve within a page, and a changed page fails with `revision_changed`
+- Use `documentType: "sfs"` for consolidated statutes (N-series numbers included) and `documentType: "votering"` for vote records; narrow slow full-text searches with `session` or `documentType`
 
 ---
 
 ### `riksdag_get_document` <sub>tool</sub>
 
-- Required `documentId` from search, or an SFS identifier (`1974:152`, `SFS 1974:152`, `sfs-1974-152`); misses return `found: false`. Omit `sections` for metadata, the outline, and the first text page, or select from `metadata`, `decisions`, `reservations`, `activities`, `properties`, `attachments`, `references`, `stakeholders`, `text`, `source_html`
-- Text and HTML page by Unicode code point (`textOffset` / `textLength`, `htmlOffset` / `htmlLength`), starting at 8,000 by default and fitting the complete response. Explicit lengths are honored. Array sections use `sectionOffset` / `sectionLimit` (default 20, clamped to 100). Follow `nextTextCall`, `nextHtmlCall`, or `sectionPages[].nextCall` with `revision`; a changed record fails with `revision_changed`
+- Required `documentId` from search, an SFS identifier (`1974:152`, `SFS 1974:152`, `sfs-1974-152`; N-series numbers such as `N2026:7` resolve to `sfs-N2026-7`), or a vote-record ID (`H6190118-1`) from a member's vote row; misses return `found: false`. Ordinary IDs come back uppercase. Omit `sections` for metadata, the outline, and the first text page, or select from `metadata`, `decisions`, `reservations`, `activities`, `properties`, `attachments`, `references`, `stakeholders`, `text`, `source_html`; `[]` returns the outline only
+- Text and HTML page by Unicode code point (`textOffset` / `textLength`, `htmlOffset` / `htmlLength`), 8,000 by default; explicit lengths are honored. Array sections use `sectionOffset` / `sectionLimit` (default 20, clamped to 100); `truncated` is true when any selected section has more entries. Follow `nextTextCall`, `nextHtmlCall`, or `sectionPages[].nextCall` with `revision`; a changed record fails with `revision_changed`
+- For a committee report (`bet`) or interpellation (`ip`) with a session, `relatedSpeechesCall` is a ready `riksdag_search_speeches` call for the speeches the source links to that document, whatever `sections` selects. It can return none, and a debate resumed later in the protocol can carry the link on its first segment only
 - Decisions and notice properties expose readable Markdown alongside original HTML. Published summary tables retain every table and its totals; stakeholders retain source names, parties, roles, order, and available numeric member IDs
 - SFS text is the published consolidation (`versionKind: "consolidated"`) and can include future-effective provisions; it is not an as-enacted or point-in-time version. Attachments are returned as links, never downloaded
 
@@ -76,8 +77,8 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 
 ### `riksdag_search_speeches` <sub>tool</sub>
 
-- `mode: "search"` (default) requires `session`; optional `memberId`, `party`, `speechType: "all" | "speech"` (`speech` excludes replies), and `headingContains`, which matches all tokens in headings and subheadings, never body text. `limit` defaults to 5 (max 20); `textCount` defaults to 1 (max 5, `0` for metadata only)
-- `mode: "get"` reads one `speechId` copied from a search item (not `sourceSpeechId`) and pages the body with `textOffset` / `textLength` and `nextTextCall`. Default text pages start at 8,000 code points and fit the complete response; explicit lengths are honored
+- `mode: "search"` (default) requires `session`; optional `memberId`, `party`, `speechType: "all" | "speech"` (`speech` excludes replies), `headingContains`, which matches all tokens in headings and subheadings, never body text, and `relatedDocumentId`, a report or interpellation document ID that keeps the speeches the source links to it (any element of a joint debate's list). Riksdagen links a speech to its debate's document only on the segment where the debate starts, so a debate interrupted and resumed later can return just its first segment; check `headingContains` with the report title for the rest. `limit` defaults to 5 (max 20); `textCount` defaults to 1 (max 5, `0` for metadata only), and each hydrated speech returns a full default text page
+- `mode: "get"` reads one `speechId` copied from a search item (not `sourceSpeechId`) and pages the body with `textOffset` / `textLength` and `nextTextCall`. Default text pages are 8,000 code points; explicit lengths are honored
 - `textState` is `included`, `not_requested`, `unavailable`, or `failed`, with recovery details on transient failures; retain `revision` on continuations
 - A missing detail, including an exact zero-byte HTTP 200 source response, returns `found: false` in get mode or `textState: "unavailable"` during search hydration
 
@@ -85,7 +86,8 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 
 ### `riksdag_get_votes` <sub>tool</sub>
 
-- Required `mode` and `session`. `mode: "report"` takes `report` (`FiU20` or `2024/25:FiU20`) or a report `documentId`, plus one `point` or `pointOffset` / `pointLimit` (default 5, max 10); `mode: "member"` takes `memberId`, optional `party`, and `offset` / `limit` (default 20, max 500)
+- Required `mode` and `session`. `mode: "report"` takes `report` (`FiU20` or `2024/25:FiU20`) or a report `documentId`, plus one `point` or `pointOffset` / `pointLimit` (default 5, max 10); a `documentId` that names a non-report, another session's report, or a report other than `report` fails with `invalid_filter`. `mode: "member"` takes `memberId`, optional `party`, `report`, and `point` (only with `report`), and `offset` / `limit` (default 20, max 500). Report and point narrow the member's rows locally with no extra upstream request, and a match-free filter succeeds with a notice
+- Member rows come in source-record timestamp order (`systemDate` ascending, then report, point, avser, `voteId`), not vote-date order; the source publishes no vote date in bulk, so rows carry none. Reports return as published (`FöU1`) and document IDs uppercase; matching ignores case
 - Report points carry the authoritative decision and party aggregates separated by source `avser`; `rollCallState` is `available`, `acclamation`, `not_published`, or `unknown`, and acclamation requires explicit decision evidence, never just empty vote rows. Incomplete groups retain unknown counts and observed labels; extra vote labels land in `otherVotes`
 - With an explicit report `point`, `ballots: true` adds individual `votes` and independent `ballotPage` pagination using `offset` / `limit`. Follow `ballotPage.nextCall` with both `revision` and `ballotRevision`; report-point counts keep their existing meaning
 - Published main votes only, not every ballot round; follow `nextCall` with `revision` for remaining points or rows
@@ -122,7 +124,13 @@ Agent-friendly output:
 
 - Source attribution, retrieval time, effective filters, and source warnings on both `content[]` and `structuredContent`
 - Complete continuation calls for rows, sections, and text, with revision checks on local continuations; a changing remote document search is not a frozen snapshot
+- Page size is the caller's `limit` (up to each tool's documented maximum, clamped with a notice); the server applies no response-size budget, and an oversized row returns whole
 - Explicit misses, unavailable text, unknown counts, and source service classifications; candidate saturation fails as `candidate_limit_reached` instead of returning an incomplete traversal
+- Identifier, session, and date inputs advertise JSON Schema patterns that admit raw untrimmed values; a malformed value fails at the schema with a message naming the field
+
+## Agent skill
+
+The server publishes one skill, `sweden-parliament-guide` (`skills/sweden-parliament-guide/SKILL.md`), covering identifier chains and gates across the `riksdag_*` tools. MCP clients read it as `skill://sweden-parliament-guide/SKILL.md` from `resources/list`; it also ships in the npm package, the Docker image, plugin installs, and the `.mcpb` bundle.
 
 ## Getting started
 
@@ -172,7 +180,7 @@ See [`.env.example`](./.env.example) for every server setting and the common fra
 
 ### Local development
 
-Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+Requires [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 
 ```sh
 git clone https://github.com/cyanheads/sweden-parliament-mcp-server.git
@@ -213,7 +221,8 @@ The image uses stateless HTTP and writes logs to `/var/log/sweden-parliament-mcp
 | Directory | Purpose |
 |:---|:---|
 | `src/index.ts` | Registers seven tools, initializes the service, and selects stateless HTTP sessions. |
-| `src/mcp-server/tools/definitions` | Seven read-only tool definitions; no resources or prompts. |
+| `src/mcp-server/tools/definitions` | Seven read-only tool definitions; no resources or prompts of its own. |
+| `skills/` | The published `sweden-parliament-guide` skill. |
 | `src/services/riksdag` | Riksdagen endpoint parsing, reference tables, transport, cache, text conversion, and continuation. |
 | `tests/` | Unit and integration tests, mirroring the `src/` structure. |
 

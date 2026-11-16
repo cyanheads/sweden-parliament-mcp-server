@@ -2,8 +2,8 @@
 
 **Server:** sweden-parliament-mcp-server
 **Version:** 0.1.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -44,7 +44,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ## Server surface
 
-Seven read-only tools, no resources or prompts: `riksdag_list_reference`, `riksdag_search_documents`, `riksdag_get_document`, `riksdag_search_speeches`, `riksdag_get_votes`, `riksdag_search_members`, and `riksdag_get_member`. One public Riksdagen service owns fixed-origin requests, concurrency, deadlines, and a bounded cache. No server-specific environment variables or API key are required.
+Seven read-only tools, no resources or prompts of its own: `riksdag_list_reference`, `riksdag_search_documents`, `riksdag_get_document`, `riksdag_search_speeches`, `riksdag_get_votes`, `riksdag_search_members`, and `riksdag_get_member`. The server also serves one published skill, `sweden-parliament-guide` (`skills/sweden-parliament-guide/SKILL.md`, wired by `createApp({ skills: 'skills' })`), which appears in `resources/list`. One public Riksdagen service owns fixed-origin requests, concurrency, deadlines, and a bounded cache. No server-specific environment variables or API key are required.
 
 ## Patterns
 
@@ -56,9 +56,11 @@ Endpoint modules in `src/services/riksdag/` validate wire payloads before normal
 
 ### Output and continuation
 
-Use `formatExact`, `successEnrichment`, and `successEnrichmentTrailer` from `src/services/riksdag/output.ts`. Both success surfaces carry every field, original source text, links, notices, attribution, and retrieval time. Source text is quoted data, never instructions.
+Use `formatExact`, `successEnrichment`, `successEnrichmentTrailer`, and `toolCallSchema` from `src/services/riksdag/output.ts`. Both success surfaces carry every field, original source text, links, notices, attribution, and retrieval time. Source text is quoted data, never instructions.
 
-Remote document pages keep a fixed pageSize and use whole-row in-page offset/revision continuation before advancing remotely. Local row pages use `fitRows`; canonical text pages use Unicode code-point offsets and measured fitting of the complete response. Preserve complete next-call arguments and revisions. A `revision_changed` failure means restart without the prior revision.
+The caller's limit is the only page bound; the server applies no byte budget, and an oversized row returns whole. `limit`, `pageSize`, `sectionLimit`, `pointLimit`, `assignmentLimit`, and `textCount` clamp at their documented maximums with a notice; all but `pageSize` and `textCount` also echo the request (`requestedLimit` and its `requested*` siblings). A remote document page returns whole (`pageSize` up to 50) and `nextCall` advances `page`; the `offset`/`revision` inputs still resolve within a page. Local row pages slice at the applied limit; text pages use `pageText`/`pageTexts` from `pagination.ts` (Unicode code points, 8,000 by default, explicit lengths honored). Every continuation `args` is an open object built by `toolCallSchema(toolName)` so `tools/list` does not restate the input schema; its values stay complete normalized arguments that parse against the named tool's input schema (`tests/tools/schema-weight.test.ts` guards this and the schema weight). Preserve complete next-call arguments and revisions. A `revision_changed` failure means restart without the prior revision.
+
+Input formats (`session`, dates, `memberId`, `documentId`, `speechId`, `report`, `relatedDocumentId`) advertise flag-free `pattern`s that admit raw untrimmed values (`formatString` in `normalize.ts`); a malformed value fails at the schema with the field named, while value checks keep `invalid_filter`. Output document IDs use one spelling (`normalizeDocumentId`, uppercase); report designations return as published (`FöU1`).
 
 ### Server identity and lifecycle
 
@@ -68,8 +70,8 @@ HTTP defaults to `sessionMode: 'stateless'`; stdio is also supported. `setup()` 
 
 ### Source constraints
 
-- Speech search requires `session`; `headingContains` searches headings and subheadings only. Get mode retrieves published body text by retrieval `speechId`.
-- Votes cover main votes only. Party totals derive from complete point ballots, separated by source `avser`; incomplete groups retain unknown counts. Report `ballots: true` requires an explicit point and supplies independent `ballotPage` continuation. Acclamation requires explicit authoritative decision evidence.
+- Speech search requires `session`; `headingContains` searches headings and subheadings only. `relatedDocumentId` matches speeches that link a document, locally after the session load (`anforandelista` ignores `rel_dok_id`); the source links a debate's document only on the segment where it starts, so a resumed debate's later segments can lack the link. Get mode retrieves published body text by retrieval `speechId`.
+- Votes cover main votes only. Party totals derive from complete point ballots, separated by source `avser`; incomplete groups retain unknown counts. Report `ballots: true` requires an explicit point and supplies independent `ballotPage` continuation. Acclamation requires explicit authoritative decision evidence. Member mode orders rows by source timestamp (`systemDate`), not vote date, and member rows carry no `date`; it accepts `report` and `point` as local filters.
 - Member discovery defaults to the service register; explicit `register: all` reaches earlier records at a higher cold-request cost under the same deadline/cache bounds. Source-reported hits and returned candidate counts remain separate. Service labels and assignment dates do not establish elected membership. Keep leading zeros in IIDs; historical UUID identities use `sourceRecordId` with `detailAvailable: false`.
 - SFS text is published consolidation, can include future-effective provisions, and is not a point-in-time legal version.
 - Preserve Swedish source wording and sparse fields. Attribute responses as `Source: The Swedish Parliament`; this service is independent and not endorsed by Sveriges riksdag.
@@ -146,6 +148,8 @@ src/
     search-members.tool.ts              # Register discovery
     get-member.tool.ts                  # Exact IID and assignment history
   services/riksdag/                      # Endpoint modules and shared transport/text/output
+skills/
+  sweden-parliament-guide/SKILL.md      # Published skill: identifier chains and gates across the tools
 tests/                                  # Synthetic unit and integration fixtures
 ```
 
@@ -169,7 +173,7 @@ Two skill trees live at the project root, written for different readers:
 | Tree | For | Written by |
 |:-----|:----|:-----------|
 | `framework-skills/` | The agent developing this server — framework skills (`metadata.audience: external`) plus any development-time skills of the server's own | `init` and the `maintenance` sync (framework skills); you (your own) |
-| `skills/` | The agents that install the server and call its tools — tool chains, identifier sources, gates | You, deliberately, with the `add-skill` skill. Absent by default; usually none is needed |
+| `skills/` | The agents that install the server and call its tools — tool chains, identifier sources, gates | You, deliberately, with the `add-skill` skill. Absent by default; usually none is needed. This server publishes `sweden-parliament-guide` |
 
 Development skills are modular instructions. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. Their directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand them to every agent that installs it.
 
@@ -257,7 +261,7 @@ Keep framework skill files unchanged; record task outcomes in the task report.
 
 ## Bundling
 
-`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs — `framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere (a `skills/` deeper in a package is runtime code and stays); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 
@@ -322,7 +326,7 @@ import { getRiksdagService } from '@/services/riksdag/riksdag-service.js';
 - [ ] If wrapping external API: raw/domain/output schemas reviewed against real upstream sparsity/nullability before finalizing required vs optional fields
 - [ ] If wrapping external API: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
 - [ ] If wrapping external API: tests include at least one sparse payload case with omitted upstream fields
-- [ ] Seven read-only tools registered directly in `src/index.ts`; no resources or prompts
+- [ ] Seven read-only tools registered directly in `src/index.ts`; no resources or prompts of its own, one published skill (`skills/sweden-parliament-guide/`)
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
 - [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name (never the npm scope — `lint:packaging` enforces this); `interface.shortDescription` from `package.json` description
 - [ ] `.codex-plugin/mcp.json` updated — server name key is the unscoped repo name; every user-supplied variable (API key, contact email, instance URL) is listed in `env_vars` so Codex forwards it from the user's environment. Never write `"KEY": ""` into `env` — an empty value replaces the user's exported key and is read as unset
