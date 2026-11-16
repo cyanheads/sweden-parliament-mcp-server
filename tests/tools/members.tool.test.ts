@@ -57,17 +57,62 @@ describe('member tool inputs', () => {
           ]),
         );
       }
-      const uuid = await runToolContract(riksdagGetMember, { memberId: 'synthetic-source-uuid' });
-      expect(uuid).toMatchObject({
-        isError: true,
-        structuredContent: { error: { data: { reason: 'invalid_filter' } } },
-      });
       const badLimit = await runToolContract(riksdagSearchMembers, { limit: 0 });
       expect(badLimit).toMatchObject({
         isError: true,
         structuredContent: { error: { code: JsonRpcErrorCode.InvalidParams } },
       });
       expect(network).not.toHaveBeenCalled();
+    } finally {
+      getRiksdagService().dispose();
+    }
+  });
+  it('rejects a malformed memberId at the schema with the format message on both surfaces', async () => {
+    const message = 'Invalid memberId; use riksdag_list_reference to check its format or code.';
+    const network = vi.fn<typeof fetch>();
+    initRiksdagService({ fetch: network });
+    try {
+      for (const memberId of [
+        'synthetic-source-uuid',
+        '12345678-1234-4234-8234-123456789abc',
+        '00 01',
+        '０００１',
+        '   ',
+      ]) {
+        expect(riksdagGetMember.input.safeParse({ memberId }).success).toBe(false);
+        const result = await runToolContract(riksdagGetMember, { memberId });
+        expect(result).toMatchObject({
+          isError: true,
+          structuredContent: { error: { code: JsonRpcErrorCode.InvalidParams } },
+        });
+        expect(JSON.stringify(result.structuredContent)).toContain(message);
+        expect(
+          result.content
+            .filter((block) => block.type === 'text')
+            .map((block) => block.text)
+            .join('\n'),
+        ).toContain(message);
+      }
+      expect(network).not.toHaveBeenCalled();
+    } finally {
+      getRiksdagService().dispose();
+    }
+  });
+  it('advertises a flag-free memberId pattern that admits padded digit IDs normalized by the handler', async () => {
+    const schema = riksdagGetMember.input['~standard'].jsonSchema.input({
+      target: 'draft-2020-12',
+    }) as { properties: { memberId: { pattern?: string; minLength?: number } } };
+    const pattern = schema.properties.memberId.pattern;
+    expect(pattern).toEqual(expect.any(String));
+    for (const id of ['0001', ' 0001 ', '\t0103624617217\n', '098412828516'])
+      expect(new RegExp(pattern!).test(id)).toBe(true);
+    for (const id of ['', 'synthetic-source-uuid', '0001a'])
+      expect(new RegExp(pattern!).test(id)).toBe(false);
+    initRiksdagService({ fetch: async () => Response.json({ personlista: { '@hits': '0' } }) });
+    try {
+      const padded = await runToolContract(riksdagGetMember, { memberId: ' 0001 ' });
+      expect(padded.isError).not.toBe(true);
+      expect(padded.structuredContent).toMatchObject({ found: false, memberId: '0001' });
     } finally {
       getRiksdagService().dispose();
     }

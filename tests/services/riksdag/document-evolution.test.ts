@@ -465,7 +465,7 @@ describe('document source evolution', () => {
       sort: expected === 'rel' ? 'relevance' : 'date',
     });
   });
-  it('fits rows and exhausts each stable remote page before advancing without loss', async () => {
+  it('exhausts each stable remote page before advancing without loss', async () => {
     const calls: URL[] = [];
     initRiksdagService({
       fetch: async (request) => {
@@ -496,10 +496,7 @@ describe('document source evolution', () => {
       expect(domain.pageSize).toBe(3);
       expect(domain.offset).toBeTypeOf('number');
       expect(domain.revision).toBeTypeOf('string');
-      expect(
-        Buffer.byteLength(JSON.stringify(result.content)) +
-          Buffer.byteLength(JSON.stringify(result.structuredContent)),
-      ).toBeLessThanOrEqual(24576);
+      expect(domain.returnedCount).toBe(domain.remoteReturnedCount);
       ids.push(...domain.items.map((row: { documentId: string }) => row.documentId));
       args = domain.nextCall?.args;
       if (args) expect(args).toMatchObject({ memberId: '00123', sort: 'relevance', pageSize: 3 });

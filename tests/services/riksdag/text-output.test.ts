@@ -1,6 +1,11 @@
 /** @fileoverview Canonical source text and reversible output rendering. @module tests/services/riksdag/text-output */
 import { describe, expect, it } from 'vitest';
-import { effectiveQuery, formatExact, renderExact } from '@/services/riksdag/output.js';
+import {
+  effectiveQuery,
+  formatExact,
+  renderExact,
+  toolCallSchema,
+} from '@/services/riksdag/output.js';
 import {
   assertRevision,
   codePointLength,
@@ -65,5 +70,34 @@ describe('canonical text and output', () => {
     expect(rendered).toContain('[source 1](<https://data.riksdagen.se/x?q=a&b=2>)');
     expect(formatExact(value)).toEqual([{ type: 'text', text: rendered }]);
     expect(effectiveQuery({ z: false, absent: undefined, a: 0 })).toBe('{"a":0,"z":false}');
+  });
+});
+
+describe('continuation call schema', () => {
+  const schema = toolCallSchema('riksdag_search_documents');
+  it('keeps every argument value unchanged and pins the tool name', () => {
+    const call = {
+      toolName: 'riksdag_search_documents',
+      args: { documentType: 'mot', offset: 20, nested: { a: [1, 'å'] }, flag: false },
+    };
+    expect(schema.parse(call)).toEqual(call);
+    expect(schema.safeParse({ ...call, toolName: 'riksdag_get_document' }).success).toBe(false);
+    expect(schema.safeParse({ toolName: call.toolName }).success).toBe(false);
+    expect(schema.safeParse({ toolName: call.toolName, args: [1] }).success).toBe(false);
+  });
+  it('emits args as an open object that restates no input schema', () => {
+    const emitted = schema['~standard'].jsonSchema.output({ target: 'draft-2020-12' }) as {
+      properties: Record<string, Record<string, unknown>>;
+    };
+    expect(emitted.properties.toolName).toMatchObject({ const: 'riksdag_search_documents' });
+    const args = emitted.properties.args!;
+    expect(args).toEqual({
+      type: 'object',
+      properties: {},
+      additionalProperties: {},
+      description:
+        'Complete normalized arguments for riksdag_search_documents, valid against its input schema; pass back unchanged.',
+    });
+    expect(new TextEncoder().encode(JSON.stringify(args)).byteLength).toBeLessThan(200);
   });
 });

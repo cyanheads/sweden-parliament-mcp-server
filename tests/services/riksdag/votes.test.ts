@@ -1,4 +1,5 @@
 /** @fileoverview Main-vote parsing and report identity at the network boundary. @module tests/services/riksdag/votes */
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { describe, expect, it, vi } from 'vitest';
 import { RiksdagService } from '@/services/riksdag/riksdag-service.js';
 import { createToolBudget } from '@/services/riksdag/transport.js';
@@ -42,25 +43,52 @@ describe('main vote endpoints', () => {
     try {
       const result = await loadMemberVotes(service, '2024/25', '0001', 'S', budget);
       expect(result).toMatchObject({ candidateCount: 4, upstreamWarnings: ['Källvarning'] });
+      // One shared timestamp and report, so rows order by point.
       expect(result.rows.map((row) => row.voteId)).toEqual([
-        'vote-0001',
-        'vote-0002',
-        'vote-0003',
         'vote-0004',
+        'vote-0003',
+        'vote-0002',
+        'vote-0001',
       ]);
       expect(result.rows[0]).toMatchObject({
         memberId: '0001',
-        point: 4,
-        date: '2025-01-02',
+        point: 1,
         systemDate: '2025-01-02 12:00:00',
-        vote: 'Avstår',
+        vote: 'Ja',
         avser: 'motivering',
-        sourceUrl: 'https://data.riksdagen.se/votering/row-4',
+        sourceUrl: 'https://data.riksdagen.se/votering/row-1',
       });
+      expect(result.rows[0]).not.toHaveProperty('date');
       expect(String(network.mock.calls[0]?.[0])).toBe(
         'https://data.riksdagen.se/voteringlista/?iid=0001&parti=S&rm=2024%2F25&sz=50000&utformat=json',
       );
       expect(network).toHaveBeenCalledTimes(1);
+    } finally {
+      service.dispose();
+    }
+  });
+  it('normalizes every linked document ID in the shared grammar and keeps any other as published', async () => {
+    const published = [
+      ['H6190118-1', 'H6190118-1'],
+      ['h6190118-1', 'H6190118-1'],
+      ['HC01FöU1', 'HC01FÖU1'],
+      ['HC01FüU1', 'HC01FüU1'],
+      ['HC010118-1', 'HC010118-1'],
+    ] as const;
+    const rows = memberVoteRows(published.length).map((row, i) => ({
+      ...row,
+      dok_id: published[i]![0],
+    }));
+    const service = new RiksdagService({
+      fetch: async () =>
+        Response.json({ voteringlista: { '@antal': String(rows.length), votering: rows } }),
+    });
+    using budget = createToolBudget();
+    try {
+      const result = await loadMemberVotes(service, '2024/25', '0001', undefined, budget);
+      expect(Object.fromEntries(result.rows.map((row) => [row.voteId, row.documentId]))).toEqual(
+        Object.fromEntries(rows.map((row, i) => [row.votering_id, published[i]![1]])),
+      );
     } finally {
       service.dispose();
     }
@@ -246,9 +274,25 @@ describe('main vote endpoints', () => {
       }
     },
   );
-  it.each(['type', 'session', 'report'])(
-    'rejects direct report metadata %s disagreement',
-    async (kind) => {
+  it.each([
+    {
+      kind: 'type',
+      message: 'is a mot document, not a committee report (bet)',
+      hint: 'riksdag_get_document with documentId HC01KU1 and sections references',
+    },
+    {
+      kind: 'session',
+      message: 'belongs to session 2025/26, not 2024/25',
+      hint: 'Retry riksdag_get_votes with session 2025/26 and the same documentId HC01KU1',
+    },
+    {
+      kind: 'report',
+      message: 'is report KU2, not KU1',
+      hint: 'Pass report or documentId alone',
+    },
+  ])(
+    'rejects a direct report documentId with another $kind as caller input',
+    async ({ kind, message, hint }) => {
       const payload = voteReport();
       if (kind === 'type') payload.dokumentstatus.dokument.doktyp = 'mot';
       if (kind === 'session') {
@@ -264,14 +308,55 @@ describe('main vote endpoints', () => {
       const service = new RiksdagService({ fetch: async () => Response.json(payload) });
       using budget = createToolBudget();
       try {
+        const failure = loadVoteReport(service, '2024/25', 'KU1', 'HC01KU1', budget);
+        await expect(failure).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringContaining(message),
+          data: { reason: 'invalid_filter', recovery: { hint: expect.stringContaining(hint) } },
+        });
+      } finally {
+        service.dispose();
+      }
+    },
+  );
+  it.each(['doktyp', 'rm', 'beteckning'] as const)(
+    'keeps a status record without published %s an upstream identity mismatch',
+    async (field) => {
+      const payload = voteReport();
+      delete (payload.dokumentstatus.dokument as Partial<typeof payload.dokumentstatus.dokument>)[
+        field
+      ];
+      const service = new RiksdagService({ fetch: async () => Response.json(payload) });
+      using budget = createToolBudget();
+      try {
         await expect(
-          loadVoteReport(service, '2024/25', 'KU1', 'HC01KU1', budget),
+          loadVoteReport(service, '2024/25', undefined, 'HC01KU1', budget),
         ).rejects.toMatchObject({ data: { reason: 'upstream_identity_mismatch' } });
       } finally {
         service.dispose();
       }
     },
   );
+  it('keeps a resolved report whose status record disagrees an upstream identity mismatch', async () => {
+    const service = new RiksdagService({
+      fetch: async (request) => {
+        const url = new URL(String(request));
+        const payload = voteReport();
+        payload.dokumentstatus.dokument.beteckning = 'KU2';
+        return url.pathname === '/dokumentstatus/HC01KU1.json'
+          ? Response.json(payload)
+          : reportFetch()(request);
+      },
+    });
+    using budget = createToolBudget();
+    try {
+      await expect(
+        loadVoteReport(service, '2024/25', 'KU1', undefined, budget),
+      ).rejects.toMatchObject({ data: { reason: 'upstream_identity_mismatch' } });
+    } finally {
+      service.dispose();
+    }
+  });
   it('loads the complete report catalog before selecting or hydrating points', async () => {
     const service = new RiksdagService({ fetch: reportFetch() });
     using budget = createToolBudget();

@@ -2,22 +2,25 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { assignmentSchema, loadMembers, memberSchema } from '../../../services/riksdag/members.js';
-import { normalizeMemberId, optionalString } from '../../../services/riksdag/normalize.js';
+import {
+  formatString,
+  normalizeMemberId,
+  optionalString,
+} from '../../../services/riksdag/normalize.js';
 import {
   effectiveQuery,
   formatExact,
   type SuccessEnrichment,
   successEnrichment,
   successEnrichmentTrailer,
+  toolCallSchema,
 } from '../../../services/riksdag/output.js';
-import { fitRows } from '../../../services/riksdag/pagination.js';
 import { getRiksdagService } from '../../../services/riksdag/riksdag-service.js';
 import { assertRevision, revisionOf } from '../../../services/riksdag/text.js';
 import { createToolBudget } from '../../../services/riksdag/transport.js';
 
 const argsSchema = z.object({
-  memberId: z
-    .string()
+  memberId: formatString('memberId', { blank: false })
     .min(1)
     .describe('Numeric memberId from riksdag_search_members, including leading zeros.'),
   assignmentOffset: z
@@ -54,23 +57,17 @@ export const riksdagGetMember = tool('riksdag_get_member', {
       truncated: z
         .boolean()
         .optional()
-        .describe('Whether further assignments remain available through nextCall.'),
+        .describe('Whether further assignments remain via nextCall.'),
       returnedCount: z.number().optional().describe('Assignments returned on this page.'),
       assignmentOffset: z.number().optional().describe('Applied assignment offset.'),
-      assignmentLimit: z.number().optional().describe('Applied assignment limit.'),
+      assignmentLimit: z.number().optional().describe('Applied assignment limit after clamping.'),
       requestedAssignmentLimit: z
         .number()
         .optional()
-        .describe('Requested assignment limit before clamping and fitting.'),
+        .describe('Requested assignment limit before clamping.'),
       hasMore: z.boolean().optional().describe('Whether assignments remain.'),
-      revision: z.string().optional().describe('Complete normalized member record revision.'),
-      nextCall: z
-        .object({
-          toolName: z.literal('riksdag_get_member').describe('Tool to call next.'),
-          args: argsSchema.describe('Complete normalized next-assignment arguments.'),
-        })
-        .optional()
-        .describe('Complete next-assignment call.'),
+      revision: z.string().optional().describe('Member record revision.'),
+      nextCall: toolCallSchema('riksdag_get_member').optional().describe('Next-assignment call.'),
     })
     .extend({
       serviceClassification: memberSchema.shape.serviceClassification.optional(),
@@ -83,7 +80,7 @@ export const riksdagGetMember = tool('riksdag_get_member', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Unknown code or malformed identifier.',
+      when: 'A memberId that passes the input pattern is not a valid ID after normalization.',
       recovery:
         'Use riksdag_list_reference to check codes and identifier formats, then retry the same tool with corrected filters.',
       thrownBy: 'service',
@@ -91,7 +88,7 @@ export const riksdagGetMember = tool('riksdag_get_member', {
     {
       reason: 'revision_changed',
       code: JsonRpcErrorCode.Conflict,
-      when: 'Continuation revision no longer matches.',
+      when: 'Revision no longer matches.',
       recovery:
         'Restart the same tool without revision and begin at the first page to read one consistent record.',
       thrownBy: 'service',
@@ -99,7 +96,7 @@ export const riksdagGetMember = tool('riksdag_get_member', {
     {
       reason: 'upstream_identity_mismatch',
       code: JsonRpcErrorCode.SerializationError,
-      when: 'Detail identity or filter rows contradict required identity.',
+      when: 'Source rows contradict the required identity.',
       recovery:
         'Copy memberId from riksdag_search_members and retry riksdag_get_member; report repeated mismatches with the request identifier.',
       thrownBy: 'service',
@@ -107,14 +104,14 @@ export const riksdagGetMember = tool('riksdag_get_member', {
     {
       reason: 'upstream_schema_invalid',
       code: JsonRpcErrorCode.SerializationError,
-      when: 'Present payload violates wire contract.',
+      when: 'Payload violates the wire contract.',
       recovery: 'Retry the same tool later; report repeated failures with the request identifier.',
       thrownBy: 'service',
     },
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Network or service error after retries.',
+      when: 'Source unavailable after retries.',
       recovery:
         'Retry riksdag_get_member with the same memberId after the source becomes available.',
       thrownBy: 'service',
@@ -122,14 +119,14 @@ export const riksdagGetMember = tool('riksdag_get_member', {
     {
       reason: 'upstream_queue_full',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'Process upstream queue is full.',
+      when: 'Upstream queue is full.',
       recovery: 'Wait before retrying the same tool, and request fewer simultaneous searches.',
       thrownBy: 'service',
     },
     {
       reason: 'candidate_limit_reached',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Complete-list safety boundary reached.',
+      when: 'Complete-list safety limit reached.',
       recovery:
         'Use riksdag_search_members with a party filter to resolve a member ID, then retry riksdag_get_member with that exact numeric ID.',
       thrownBy: 'service',
@@ -168,45 +165,38 @@ export const riksdagGetMember = tool('riksdag_get_member', {
     enrichment.notices.push(
       'Assignment dates are source data and do not establish historical sitting status.',
     );
-    const result = fitRows({
-      rows: assignments,
-      offset: filters.assignmentOffset,
-      limit: filters.assignmentLimit,
-      enrichment,
-      budget,
-      build: (selected, assignmentLimit) => {
-        const hasMore = filters.assignmentOffset + selected.length < assignments.length;
-        return {
-          found: true,
-          ...member,
-          assignments: selected,
-          assignmentTotal: assignments.length,
-          returnedCount: selected.length,
-          assignmentOffset: filters.assignmentOffset,
-          assignmentLimit,
-          requestedAssignmentLimit: input.assignmentLimit,
-          revision,
-          hasMore,
-          truncated: hasMore,
-          ...(hasMore
-            ? {
-                nextCall: {
-                  toolName: 'riksdag_get_member' as const,
-                  args: {
-                    ...filters,
-                    assignmentLimit,
-                    assignmentOffset: filters.assignmentOffset + selected.length,
-                    revision,
-                  },
-                },
-              }
-            : {}),
-        };
-      },
-    });
     budget.check();
+    const selected = assignments.slice(
+      filters.assignmentOffset,
+      filters.assignmentOffset + filters.assignmentLimit,
+    );
+    const hasMore = filters.assignmentOffset + selected.length < assignments.length;
     ctx.enrich(enrichment);
-    return result;
+    return {
+      found: true,
+      ...member,
+      assignments: selected,
+      assignmentTotal: assignments.length,
+      returnedCount: selected.length,
+      assignmentOffset: filters.assignmentOffset,
+      assignmentLimit: filters.assignmentLimit,
+      requestedAssignmentLimit: input.assignmentLimit,
+      revision,
+      hasMore,
+      truncated: hasMore,
+      ...(hasMore
+        ? {
+            nextCall: {
+              toolName: 'riksdag_get_member' as const,
+              args: {
+                ...filters,
+                assignmentOffset: filters.assignmentOffset + selected.length,
+                revision,
+              },
+            },
+          }
+        : {}),
+    };
   },
   format: formatExact,
 });

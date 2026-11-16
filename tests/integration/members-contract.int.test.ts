@@ -7,6 +7,7 @@ import { riksdagGetMember } from '@/mcp-server/tools/definitions/get-member.tool
 import { riksdagSearchMembers } from '@/mcp-server/tools/definitions/search-members.tool.js';
 import { successEnrichment } from '@/services/riksdag/output.js';
 import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksdag-service.js';
+import { continuationArgs } from '../services/riksdag/continuation-fixtures.js';
 import { memberDetail, memberRows } from '../services/riksdag/member-fixtures.js';
 
 afterEach(() => {
@@ -84,11 +85,17 @@ describe('member public contracts', () => {
       nextCall: { args: { register: 'all' } },
     });
     expect(domainText(first)).toEqual(page);
-    const second = await runToolContract(riksdagSearchMembers, page.nextCall!.args);
+    const second = await runToolContract(
+      riksdagSearchMembers,
+      continuationArgs(riksdagSearchMembers, page.nextCall),
+    );
     const secondPage = riksdagSearchMembers.output.parse(second.structuredContent);
     expect(assertSuccess(second).retrievedAt).toBe(enrichment.retrievedAt);
     expect(domainText(second)).toEqual(secondPage);
-    const third = await runToolContract(riksdagSearchMembers, secondPage.nextCall!.args);
+    const third = await runToolContract(
+      riksdagSearchMembers,
+      continuationArgs(riksdagSearchMembers, secondPage.nextCall),
+    );
     assertSuccess(third);
     expect(third.structuredContent).toMatchObject({
       items: [{ detailAvailable: false, sourceRecordId: rows[2]!.sourceid }],
@@ -220,7 +227,10 @@ describe('member public contracts', () => {
     expect(network).toHaveBeenCalledTimes(1);
     changed = true;
     vi.advanceTimersByTime(300000);
-    const drift = await runToolContract(riksdagSearchMembers, page.nextCall!.args);
+    const drift = await runToolContract(
+      riksdagSearchMembers,
+      continuationArgs(riksdagSearchMembers, page.nextCall),
+    );
     expect(drift).toMatchObject({
       isError: true,
       structuredContent: {
@@ -296,7 +306,10 @@ describe('member public contracts', () => {
       limit: 1,
       revision: page.revision,
     });
-    const next = await runToolContract(riksdagSearchMembers, page.nextCall!.args);
+    const next = await runToolContract(
+      riksdagSearchMembers,
+      continuationArgs(riksdagSearchMembers, page.nextCall),
+    );
     assertSuccess(next);
     expect(next.structuredContent).toMatchObject({
       revision: page.revision,
@@ -361,7 +374,7 @@ describe('member public contracts', () => {
     expect(network).toHaveBeenCalledTimes(1);
   });
   it.each([100, 101, 100000])(
-    'reports requested search limit %i and traverses variable fitted pages without repeats',
+    'reports requested search limit %i and traverses full applied-limit pages without repeats',
     async (limit) => {
       const rows = Array.from({ length: 105 }, (_, i) => ({
         intressent_id: String(i).padStart(4, '0'),
@@ -378,7 +391,8 @@ describe('member public contracts', () => {
         const enrichment = assertSuccess(result);
         const page = riksdagSearchMembers.output.parse(result.structuredContent);
         expect(domainText(result)).toEqual(page);
-        expect(page.limit).toBeLessThanOrEqual(100);
+        expect(page.limit).toBe(100);
+        expect(page.returnedCount).toBe(Math.min(100, 105 - ids.length));
         expect(page.requestedLimit).toBe(args.limit);
         expect(page.offset).toBe(ids.length);
         if (ids.length === 0)
@@ -386,7 +400,7 @@ describe('member public contracts', () => {
         for (const member of page.items) ids.push(member.memberId!);
         if (!page.nextCall) break;
         expect(page.nextCall.args.offset).toBe(ids.length);
-        args = riksdagSearchMembers.input.parse(page.nextCall.args);
+        args = continuationArgs(riksdagSearchMembers, page.nextCall);
       }
       expect(ids).toEqual(Array.from({ length: 105 }, (_, i) => String(i).padStart(4, '0')));
     },
@@ -406,7 +420,8 @@ describe('member public contracts', () => {
         const page = riksdagGetMember.output.parse(result.structuredContent);
         expect(domainText(result)).toEqual(page);
         expect(page.requestedAssignmentLimit).toBe(args.assignmentLimit);
-        expect(page.assignmentLimit).toBeLessThanOrEqual(100);
+        expect(page.assignmentLimit).toBe(100);
+        expect(page.returnedCount).toBe(Math.min(100, 105 - organs.length));
         expect(page.assignmentOffset).toBe(organs.length);
         if (!organs.length)
           expect(enrichment.notices.some((notice) => notice.includes('clamped'))).toBe(
@@ -415,12 +430,12 @@ describe('member public contracts', () => {
         organs.push(...(page.assignments ?? []).map((entry) => entry.organ!));
         if (!page.nextCall) break;
         expect(page.nextCall.args.assignmentOffset).toBe(organs.length);
-        args = riksdagGetMember.input.parse(page.nextCall.args);
+        args = continuationArgs(riksdagGetMember, page.nextCall);
       }
       expect(organs).toEqual(Array.from({ length: 105 }, (_, i) => `ORG${105 - i}`));
     },
   );
-  it('returns intact oversized assignment rows with truthful continuation and no silent slicing', async () => {
+  it('returns oversized assignment rows whole and never shortens the requested page', async () => {
     const person = memberDetail(2);
     person.personuppdrag.uppdrag[0]!.uppgift = ['x'.repeat(20000)];
     initRiksdagService({
@@ -432,13 +447,66 @@ describe('member public contracts', () => {
     });
     const enrichment = assertSuccess(result);
     expect(result.structuredContent).toMatchObject({
-      assignments: [{ descriptions: ['x'.repeat(20000)] }],
-      returnedCount: 1,
-      nextCall: { args: { assignmentOffset: 1 } },
+      assignments: [{ descriptions: ['x'.repeat(20000)] }, { organ: 'ORG1' }],
+      assignmentTotal: 2,
+      returnedCount: 2,
+      assignmentLimit: 2,
+      hasMore: false,
+      truncated: false,
     });
-    expect(enrichment.notices.join(' ')).toContain('indivisible entry');
+    expect(result.structuredContent).not.toHaveProperty('nextCall');
+    expect(enrichment.notices.join(' ')).not.toMatch(/indivisible|response target|shortened/);
     expect(domainText(result)).toEqual(riksdagGetMember.output.parse(result.structuredContent));
   });
+  it.each([
+    [100, 100],
+    [101, 100],
+  ])(
+    'returns min(assignmentLimit %i, remaining) heavy assignments and continues with the applied %i',
+    async (assignmentLimit, applied) => {
+      const person = memberDetail(105);
+      for (const assignment of person.personuppdrag.uppdrag) assignment.uppgift = ['å'.repeat(400)];
+      initRiksdagService({
+        fetch: async () => Response.json({ personlista: { '@hits': '1', person } }),
+      });
+      const result = await runToolContract(riksdagGetMember, { memberId: '0001', assignmentLimit });
+      const enrichment = assertSuccess(result);
+      const page = riksdagGetMember.output.parse(result.structuredContent);
+      expect(domainText(result)).toEqual(page);
+      expect(page).toMatchObject({
+        assignmentTotal: 105,
+        returnedCount: applied,
+        assignmentLimit: applied,
+        requestedAssignmentLimit: assignmentLimit,
+        hasMore: true,
+        truncated: true,
+      });
+      expect(page.assignments).toHaveLength(applied);
+      expect(page.nextCall).toEqual({
+        toolName: 'riksdag_get_member',
+        args: {
+          memberId: '0001',
+          assignmentOffset: applied,
+          assignmentLimit: applied,
+          revision: page.revision,
+        },
+      });
+      expect(enrichment.notices.join(' ')).not.toMatch(/indivisible|response target|shortened/);
+      const rest = await runToolContract(
+        riksdagGetMember,
+        continuationArgs(riksdagGetMember, page.nextCall),
+      );
+      assertSuccess(rest);
+      expect(rest.structuredContent).toMatchObject({
+        returnedCount: 5,
+        assignmentOffset: applied,
+        assignmentLimit: applied,
+        hasMore: false,
+        truncated: false,
+      });
+      expect(rest.structuredContent).not.toHaveProperty('nextCall');
+    },
+  );
   it('returns exact misses, empty assignment history and offsets beyond the end with enrichment', async () => {
     initRiksdagService({ fetch: async () => Response.json({ personlista: { '@hits': '0' } }) });
     const missing = await runToolContract(riksdagGetMember, { memberId: '0001' });
@@ -499,7 +567,10 @@ describe('member public contracts', () => {
     expect(network).toHaveBeenCalledTimes(1);
     changed = true;
     vi.advanceTimersByTime(300000);
-    const drift = await runToolContract(riksdagGetMember, page.nextCall!.args);
+    const drift = await runToolContract(
+      riksdagGetMember,
+      continuationArgs(riksdagGetMember, page.nextCall),
+    );
     expect(drift).toMatchObject({
       isError: true,
       structuredContent: {
@@ -544,7 +615,7 @@ describe('member public contracts', () => {
       expect(text).toContain('party');
     },
   );
-  it('discloses requested and applied search limits and measured whole-row shortening', async () => {
+  it('discloses requested and applied search limits and returns every heavy row whole', async () => {
     initRiksdagService({
       fetch: async () =>
         Response.json({
@@ -552,24 +623,83 @@ describe('member public contracts', () => {
             '@hits': '4',
             person: Array.from({ length: 4 }, (_, i) => ({
               intressent_id: String(i + 1),
-              tilltalsnamn: 'x'.repeat(2500),
+              tilltalsnamn: 'x'.repeat(10000),
               efternamn: 'Synthetic',
             })),
           },
         }),
     });
     const result = await runToolContract(riksdagSearchMembers, { limit: 101 });
-    expect(result.isError).not.toBe(true);
+    const enrichment = assertSuccess(result);
     expect(result.structuredContent).toMatchObject({
       requestedLimit: 101,
-      truncated: true,
-      hasMore: true,
+      limit: 100,
+      returnedCount: 4,
+      hasMore: false,
     });
+    expect(result.structuredContent).not.toHaveProperty('truncated');
+    expect(result.structuredContent).not.toHaveProperty('nextCall');
+    expect(enrichment.notices).toContain('Requested limit was clamped to 100.');
+    expect(enrichment.notices.join(' ')).not.toMatch(/indivisible|response target|shortened/);
     const first = result.content[0];
     if (first?.type !== 'text') throw new Error('Expected domain text.');
     expect(first.text).toContain('"requestedLimit": 101');
-    expect(first.text).toContain('"truncated": true');
+    expect(first.text).toContain('"limit": 100');
+    expect(first.text).not.toContain('"truncated"');
+    expect(domainText(result)).toEqual(riksdagSearchMembers.output.parse(result.structuredContent));
   });
+  it.each([
+    [100, 100],
+    [101, 100],
+  ])(
+    'returns min(limit %i, remaining) heavy search rows and continues with the applied %i',
+    async (limit, applied) => {
+      const rows = Array.from({ length: 105 }, (_, i) => ({
+        intressent_id: String(i + 1).padStart(4, '0'),
+        tilltalsnamn: 'å'.repeat(400),
+        efternamn: `Synthetic ${i + 1}`,
+      }));
+      initRiksdagService({
+        fetch: async () => Response.json({ personlista: { '@hits': '105', person: rows } }),
+      });
+      const result = await runToolContract(riksdagSearchMembers, { limit });
+      const enrichment = assertSuccess(result);
+      const page = riksdagSearchMembers.output.parse(result.structuredContent);
+      expect(domainText(result)).toEqual(page);
+      expect(page).toMatchObject({
+        totalCount: 105,
+        returnedCount: applied,
+        limit: applied,
+        requestedLimit: limit,
+        hasMore: true,
+      });
+      expect(page.items).toHaveLength(applied);
+      expect(result.structuredContent).not.toHaveProperty('truncated');
+      expect(page.nextCall).toEqual({
+        toolName: 'riksdag_search_members',
+        args: {
+          register: 'service',
+          sitting: 'all',
+          offset: applied,
+          limit: applied,
+          revision: page.revision,
+        },
+      });
+      expect(enrichment.notices.join(' ')).not.toMatch(/indivisible|response target|shortened/);
+      const rest = await runToolContract(
+        riksdagSearchMembers,
+        continuationArgs(riksdagSearchMembers, page.nextCall),
+      );
+      assertSuccess(rest);
+      expect(rest.structuredContent).toMatchObject({
+        returnedCount: 5,
+        offset: applied,
+        limit: applied,
+        hasMore: false,
+      });
+      expect(rest.structuredContent).not.toHaveProperty('nextCall');
+    },
+  );
   it('discloses requested assignment limit independently from the applied limit', async () => {
     initRiksdagService({
       fetch: async () =>

@@ -31,7 +31,6 @@ export function memberVoteRows(count = 4) {
     rm: '2024/25',
     beteckning: 'KU1',
     punkt: String(i + 1),
-    datum: '2025-01-02',
     systemdatum: '2025-01-02 12:00:00',
     namn: 'Synthetic Member',
     parti: 'S',
@@ -41,6 +40,159 @@ export function memberVoteRows(count = 4) {
     dok_id: 'HC01KU1',
     votering_url_xml: `/votering/row-${i + 1}`,
   }));
+}
+
+/** One member-0001 vote row for report `beteckning`; `systemdatum` is omitted when absent. */
+export function timestampedMemberRow(
+  votering_id: string,
+  beteckning: string,
+  punkt: string,
+  avser: string,
+  systemdatum?: string,
+) {
+  return {
+    votering_id,
+    intressent_id: '0001',
+    rm: '2024/25',
+    beteckning,
+    punkt,
+    avser,
+    parti: 'S',
+    rost: 'Ja',
+    dok_id: `HC01${beteckning}`,
+    ...(systemdatum ? { systemdatum } : {}),
+  };
+}
+
+/** One member's rows with varied, shared and missing source timestamps, in scrambled source order. */
+export function timestampedMemberRows() {
+  const row = timestampedMemberRow;
+  return [
+    row('F', 'KU3', '1', 'sakfrågan'),
+    row('A', 'KU2', '1', 'sakfrågan', '2025-01-03 10:00:00'),
+    row('H', 'KU4', '2', 'sakfrågan', '2025-01-01 08:00:00'),
+    row('C', 'KU1', '1', 'sakfrågan', '2025-01-02 09:00:00'),
+    row('G', 'KU1', '1', 'motivfrågan'),
+    row('E', 'KU1', '0', 'frågan', '2025-01-02 09:00:00'),
+    row('B', 'KU1', '2', 'sakfrågan', '2025-01-02 09:00:00'),
+    row('H', 'KU4', '2', 'motivfrågan', '2025-01-01 08:00:00'),
+    row('D', 'FiU1', '3', 'sakfrågan', '2025-01-02 09:00:00'),
+  ];
+}
+
+/**
+ * One member's 2024/25 rows across reports: FöU1 points 1 and 3 (one published decomposed), a
+ * point-zero `votering` row whose designation is not a report, and a row without a designation.
+ */
+export function memberReportRows() {
+  const row = (
+    votering_id: string,
+    beteckning: string | undefined,
+    punkt: string,
+    rost: string,
+    systemdatum: string,
+    dok_id: string,
+  ) => ({
+    votering_id,
+    intressent_id: '098412828516',
+    rm: '2024/25',
+    ...(beteckning === undefined ? {} : { beteckning }),
+    punkt,
+    systemdatum,
+    parti: 'S',
+    rost,
+    avser: 'sakfrågan',
+    dok_id,
+  });
+  return [
+    row('V-KU1-1', 'KU1', '1', 'Ja', '2024-11-20 10:00:00', 'HC01KU1'),
+    row('V-FOU1-3', 'FöU1', '3', 'Ja', '2024-12-04 16:16:26', 'HC01FöU1'),
+    row('V-VOTERING', '0118-1', '0', 'Ja', '2025-01-18 10:00:00', 'HC010118-1'),
+    row('V-FIU1-2', 'FiU1', '2', 'Nej', '2024-11-27 10:00:00', 'HC01FiU1'),
+    row('V-SPARSE', undefined, '1', 'Ja', '2024-12-01 10:00:00', 'HC01SKU1'),
+    row('V-FOU1-1', 'FöU1', '1', 'Nej', '2024-12-04 16:16:26', 'HC01FöU1'),
+  ];
+}
+
+/**
+ * Report FöU1 as Riksdagen publishes it: mixed-case designation and document ID on the list,
+ * status and ballot routes, three points, and `ballotCount` ballots per point.
+ */
+export function publishedReportFetch(ballotCount = 3): typeof fetch {
+  const document = { dok_id: 'HC01FöU1', doktyp: 'bet', rm: '2024/25', beteckning: 'FöU1' };
+  return async (request) => {
+    const url = new URL(String(request));
+    const path = decodeURIComponent(url.pathname);
+    if (path === '/dokumentlista/')
+      return Response.json({ dokumentlista: { '@traffar': '1', dokument: document } });
+    if (path === '/dokumentstatus/HC01FÖU1.json')
+      return Response.json({
+        dokumentstatus: {
+          dokument: document,
+          dokutskottsforslag: {
+            utskottsforslag: [1, 2, 3].map((punkt) => ({
+              punkt: String(punkt),
+              beslutstyp: 'röstning',
+              rm: '2024/25',
+              bet: 'FöU1',
+            })),
+          },
+        },
+      });
+    if (path === '/voteringlista/') {
+      const punkt = url.searchParams.get('punkt') ?? '';
+      return Response.json({
+        voteringlista: {
+          '@antal': String(ballotCount),
+          votering: Array.from({ length: ballotCount }, (_, i) => ({
+            votering_id: `V-FOU1-${punkt}`,
+            intressent_id: String(i + 1).padStart(4, '0'),
+            rm: '2024/25',
+            beteckning: 'FöU1',
+            punkt,
+            parti: 'S',
+            rost: 'Ja',
+            avser: 'sakfrågan',
+            dok_id: 'HC01FöU1',
+          })),
+        },
+      });
+    }
+    throw new Error(`Unexpected synthetic route ${path}`);
+  };
+}
+
+/**
+ * Rows carrying every field Riksdagen publishes, at published lengths: one point's KU1 ballots
+ * (one voteId, many members) or one member's session rows (many voteIds).
+ */
+export function publishedSizeRows(count: number, shape: 'ballots' | 'member') {
+  return Array.from({ length: count }, (_, i) => {
+    const voteId =
+      shape === 'ballots'
+        ? '0D9B5C9E-4A3B-4F7A-9C1E-2B6A8D4E7F10'
+        : `0D9B5C9E-4A3B-4F7A-9C1E-${String(i).padStart(12, '0')}`;
+    return {
+      hangar_id: String(5296756 + i),
+      votering_id: voteId,
+      intressent_id: shape === 'ballots' ? String(i + 1).padStart(13, '0') : '0257612529618',
+      rm: '2024/25',
+      beteckning: 'KU1',
+      punkt: shape === 'ballots' ? '1' : String((i % 30) + 1),
+      punkttyp: 'Huvudvotering',
+      systemdatum: '2024-12-04 16:16:26',
+      namn: `Syntetisk Ledamot ${i}`,
+      fornamn: 'Syntetisk',
+      efternamn: `Ledamot ${i}`,
+      parti: 'S',
+      valkrets: 'Västra Götalands läns västra',
+      rost: i % 3 ? 'Ja' : 'Nej',
+      avser: 'sakfrågan',
+      votering: 'huvud',
+      dok_id: 'HC01KU1',
+      votering_url_xml: `http://data.riksdagen.se/votering/${voteId}`,
+    };
+  });
 }
 
 /** Route only known report endpoints; grouped data remains controlled by the test. */

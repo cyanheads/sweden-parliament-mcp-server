@@ -68,6 +68,45 @@ describe('speech endpoint contracts', () => {
       service.dispose();
     }
   });
+  it('normalizes each related document ID element and preserves elements that are not IDs', async () => {
+    const related = [
+      'HC01FöU1',
+      'HC01FöU1',
+      'hc10134, HC10150, hc01föu1, HC10488, sfs 2000:100',
+      'HC10447, okänd länk, X, HC10450',
+      'X',
+      '',
+      undefined,
+    ];
+    const fixture = speechList(related.length);
+    for (const [index, value] of related.entries())
+      Object.assign(fixture.anforandelista.anforande[index]!, { rel_dok_id: value });
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementationOnce(async () => Response.json(fixture))
+      .mockImplementationOnce(async () =>
+        Response.json({ anforande: { ...speechRow(3), rel_dok_id: related[2] } }),
+      );
+    const service = new RiksdagService({ fetch: network });
+    using budget = createToolBudget();
+    try {
+      const { records } = await loadSpeechCandidates(service, budget, filters);
+      expect(records.map((record) => record.relatedDocumentId)).toEqual([
+        'HC01FÖU1',
+        'HC01FÖU1',
+        'HC10134, HC10150, HC01FÖU1, HC10488, sfs-2000-100',
+        'HC10447, okänd länk, X, HC10450',
+        'X',
+        undefined,
+        undefined,
+      ]);
+      await expect(loadSpeechDetail(service, budget, 'HC091-3')).resolves.toMatchObject({
+        record: { relatedDocumentId: 'HC10134, HC10150, HC01FÖU1, HC10488, sfs-2000-100' },
+      });
+    } finally {
+      service.dispose();
+    }
+  });
   it.each([undefined, null, []])('normalizes empty children %j', async (anforande) => {
     const service = new RiksdagService({
       fetch: async () => Response.json({ anforandelista: { '@antal': '0', anforande } }),

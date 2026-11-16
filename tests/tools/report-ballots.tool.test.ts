@@ -1,9 +1,15 @@
 /** @fileoverview Report ballot pagination and independent revision contracts. @module tests/tools/report-ballots.tool */
+import type { z } from '@cyanheads/mcp-ts-core';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { riksdagGetVotes } from '@/mcp-server/tools/definitions/get-votes.tool.js';
 import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksdag-service.js';
-import { reportFetch } from '../services/riksdag/vote-fixtures.js';
+import { continuationArgs } from '../services/riksdag/continuation-fixtures.js';
+import {
+  publishedReportFetch,
+  publishedSizeRows,
+  reportFetch,
+} from '../services/riksdag/vote-fixtures.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -83,7 +89,8 @@ describe('report ballots', () => {
         memberId: '0001',
       }),
     );
-    expect(result.votes!.map((row) => row.avser)).toEqual(['sakfrågan', 'motivfrågan', 'annan']);
+    // Source order is sakfrågan, motivfrågan, annan; shared vote/member rows order by avser.
+    expect(result.votes!.map((row) => row.avser)).toEqual(['annan', 'motivfrågan', 'sakfrågan']);
     for (const row of result.votes!) {
       expect(row).toMatchObject({ memberId: '0001', documentId: 'HC01KU1', report: 'KU1' });
       expect(row).not.toHaveProperty('point');
@@ -110,6 +117,31 @@ describe('report ballots', () => {
       otherVotes: [{ vote: 'Annan röst' }],
     });
     expect(JSON.stringify(result.content)).toContain('exact counts remain unknown');
+  });
+  it('orders one point’s ballots by voteId, then memberId, whatever the source order', async () => {
+    const ballot = (votering_id: string, intressent_id: string, avser: string) => ({
+      ...rows()[0],
+      votering_id,
+      intressent_id,
+      avser,
+    });
+    // Two votes on point 1 across two members; voteId order runs opposite to avser order.
+    const source = [
+      ballot('V2', '0001', 'motivfrågan'),
+      ballot('V1', '0002', 'sakfrågan'),
+      ballot('V2', '0002', 'motivfrågan'),
+      ballot('V1', '0001', 'sakfrågan'),
+    ];
+    initRiksdagService({
+      fetch: reportFetch(() => ({ voteringlista: { '@antal': '4', votering: source } })),
+    });
+    const domain = success(await runToolContract(riksdagGetVotes, { ...args, limit: 20 }));
+    expect(domain.votes!.map((row) => `${row.voteId}/${row.memberId}`)).toEqual([
+      'V1/0001',
+      'V1/0002',
+      'V2/0001',
+      'V2/0002',
+    ]);
   });
   it.each([
     { mode: 'member', memberId: '0001', ballots: true },
@@ -226,41 +258,91 @@ describe('report ballots', () => {
       });
       input = riksdagGetVotes.input.parse(result.ballotPage!.nextCall.args);
     }
-    expect(subjects).toEqual(['sakfrågan', 'motivfrågan', 'annan']);
+    expect(subjects).toEqual(['annan', 'motivfrågan', 'sakfrågan']);
     expect(network).toHaveBeenCalledTimes(2);
   });
-  it('fits whole ballot rows around the retained report decision through repeated page re-slices', async () => {
-    const ballots = Array.from({ length: 24 }, (_, index) => ({
-      ...rows()[0],
-      intressent_id: `0${String(index).padStart(3, '0')}`,
-      namn: 'x'.repeat(1600),
+  const published349 = () =>
+    reportFetch(() => ({
+      voteringlista: { '@antal': '349', votering: publishedSizeRows(349, 'ballots') },
     }));
-    const network = vi
-      .fn<typeof fetch>()
-      .mockImplementation(
-        reportFetch(() => ({ voteringlista: { '@antal': '24', votering: ballots } })),
-      );
+  it.each([500, 600])(
+    'returns every one of 349 published-size ballots at limit %i in one page',
+    async (limit) => {
+      initRiksdagService({ fetch: published349() });
+      const result = await runToolContract(riksdagGetVotes, { ...args, limit });
+      const domain = success(result);
+      expect(domain.votes).toHaveLength(349);
+      // The raw surface, so a field the output schema no longer declares cannot hide in parsing.
+      expect(result.structuredContent).not.toHaveProperty('truncated');
+      expect(result.structuredContent).toHaveProperty('ballotPage', {
+        revision: expect.any(String),
+        totalCount: 349,
+        returnedCount: 349,
+        offset: 0,
+        limit: 500,
+        requestedLimit: limit,
+        hasMore: false,
+      });
+      const notices = JSON.stringify(result.structuredContent);
+      expect(notices.includes('Requested limit was clamped to 500.')).toBe(limit > 500);
+      expect(notices).not.toMatch(/response target|shortened/);
+    },
+  );
+  it('pages published-size ballots at the requested limit through every re-slice', async () => {
+    const network = vi.fn<typeof fetch>().mockImplementation(published349());
     initRiksdagService({ fetch: network });
-    let input = riksdagGetVotes.input.parse({ ...args, limit: 100000 });
+    let input: z.input<typeof riksdagGetVotes.input> = { ...args, limit: 100 };
+    const pageSizes: number[] = [];
     const memberIds: string[] = [];
-    let pages = 0;
     for (;;) {
-      const result = success(await runToolContract(riksdagGetVotes, input));
+      const raw = await runToolContract(riksdagGetVotes, input);
+      const result = success(raw);
       expect(result).toMatchObject({ returnedCount: 1, points: [{ decision: { point: 1 } }] });
-      expect(result.ballotPage!.offset).toBe(memberIds.length);
-      expect(result.ballotPage!.returnedCount).toBe(result.votes!.length);
-      expect(result.ballotPage!.limit).toBeLessThanOrEqual(500);
+      expect(result.ballotPage).toMatchObject({ offset: memberIds.length, limit: 100 });
+      expect(raw.structuredContent).not.toHaveProperty('ballotPage.truncated');
+      expect(raw.structuredContent).not.toHaveProperty('truncated');
+      pageSizes.push(result.votes!.length);
       memberIds.push(...result.votes!.map((row) => row.memberId));
-      pages++;
       if (!result.ballotPage!.nextCall) break;
-      expect(result.ballotPage!.truncated).toBe(true);
-      input = riksdagGetVotes.input.parse(result.ballotPage!.nextCall.args);
+      expect(result.ballotPage!.nextCall.args).toMatchObject({
+        limit: 100,
+        offset: memberIds.length,
+      });
+      input = continuationArgs(riksdagGetVotes, result.ballotPage!.nextCall);
     }
-    expect(pages).toBeGreaterThan(2);
+    expect(pageSizes).toEqual([100, 100, 100, 49]);
     expect(memberIds).toEqual(
-      Array.from({ length: 24 }, (_, index) => `0${String(index).padStart(3, '0')}`),
+      Array.from({ length: 349 }, (_, i) => String(i + 1).padStart(13, '0')),
     );
     expect(network).toHaveBeenCalledTimes(2);
+  });
+  it('returns the published designation and normalized ballot document IDs through ballot continuation', async () => {
+    initRiksdagService({ fetch: publishedReportFetch(3) });
+    let input: z.input<typeof riksdagGetVotes.input> = {
+      mode: 'report',
+      session: '2024/25',
+      report: 'FÖU1',
+      point: 2,
+      ballots: true,
+      limit: 2,
+    };
+    const memberIds: string[] = [];
+    for (;;) {
+      const result = success(await runToolContract(riksdagGetVotes, input));
+      expect(result).toMatchObject({ report: 'FöU1', documentId: 'HC01FÖU1' });
+      for (const row of result.votes!)
+        expect(row).toMatchObject({ report: 'FöU1', documentId: 'HC01FÖU1', point: 2 });
+      memberIds.push(...result.votes!.map((row) => row.memberId));
+      if (!result.ballotPage!.nextCall) break;
+      expect(result.ballotPage!.nextCall.args).toMatchObject({
+        report: 'FöU1',
+        documentId: 'HC01FÖU1',
+        point: 2,
+        ballots: true,
+      });
+      input = continuationArgs(riksdagGetVotes, result.ballotPage!.nextCall);
+    }
+    expect(memberIds).toEqual(['0001', '0002', '0003']);
   });
   it('rejects changed ballot data while the report catalog stays unchanged', async () => {
     vi.useFakeTimers();
@@ -275,7 +357,10 @@ describe('report ballots', () => {
     const first = success(await runToolContract(riksdagGetVotes, args));
     changed = true;
     vi.advanceTimersByTime(300001);
-    const result = await runToolContract(riksdagGetVotes, first.ballotPage!.nextCall!.args);
+    const result = await runToolContract(
+      riksdagGetVotes,
+      continuationArgs(riksdagGetVotes, first.ballotPage!.nextCall),
+    );
     expect(result).toMatchObject({
       isError: true,
       structuredContent: {

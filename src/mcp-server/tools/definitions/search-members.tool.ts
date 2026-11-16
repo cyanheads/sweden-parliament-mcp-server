@@ -14,8 +14,8 @@ import {
   type SuccessEnrichment,
   successEnrichment,
   successEnrichmentTrailer,
+  toolCallSchema,
 } from '../../../services/riksdag/output.js';
-import { fitRows } from '../../../services/riksdag/pagination.js';
 import { getRiksdagService } from '../../../services/riksdag/riksdag-service.js';
 import { assertRevision, revisionOf } from '../../../services/riksdag/text.js';
 import { createToolBudget } from '../../../services/riksdag/transport.js';
@@ -25,7 +25,7 @@ const argsSchema = z.object({
     .enum(['service', 'all'])
     .default('service')
     .describe(
-      'Register scope; all includes historical records and can require a large cold request that reaches the normal timeout.',
+      'Register scope; all includes historical records, and a cold request can reach the normal timeout.',
     ),
   nameContains: z
     .string()
@@ -55,27 +55,18 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
     items: z.array(memberSchema).describe('Filtered member-register rows.'),
     candidateCount: z
       .number()
-      .describe('Actual returned candidate records in the selected register scope.'),
+      .describe('Returned candidate records in the selected register scope.'),
     sourceReportedCount: z
       .number()
-      .describe(
-        'Source-reported register hits; may differ from actual returned candidates in all scope.',
-      ),
+      .describe('Source-reported hits; can differ from returned candidates in all scope.'),
     totalCount: z.number().describe('Exact count after local filtering.'),
     returnedCount: z.number().describe('Rows in this page.'),
     offset: z.number().describe('Applied local offset.'),
-    limit: z.number().describe('Applied row limit.'),
-    requestedLimit: z.number().describe('Requested row limit before clamping and fitting.'),
-    truncated: z.boolean().describe('Whether response fitting shortened the selected page.'),
+    limit: z.number().describe('Applied row limit after clamping.'),
+    requestedLimit: z.number().describe('Requested row limit before clamping.'),
     hasMore: z.boolean().describe('Whether filtered rows remain.'),
     revision: z.string().describe('Complete candidate-set revision.'),
-    nextCall: z
-      .object({
-        toolName: z.literal('riksdag_search_members').describe('Tool to call next.'),
-        args: argsSchema.describe('Complete normalized next-page arguments.'),
-      })
-      .optional()
-      .describe('Complete next-page call.'),
+    nextCall: toolCallSchema('riksdag_search_members').optional().describe('Next-page call.'),
   }),
   enrichment: successEnrichment,
   enrichmentTrailer: successEnrichmentTrailer,
@@ -83,7 +74,7 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Unknown code or malformed identifier.',
+      when: 'Unknown party or constituency code, or punctuation-only nameContains.',
       recovery:
         'Use riksdag_list_reference to check codes and identifier formats, then retry the same tool with corrected filters.',
       thrownBy: 'service',
@@ -91,7 +82,7 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
     {
       reason: 'revision_changed',
       code: JsonRpcErrorCode.Conflict,
-      when: 'Continuation revision no longer matches.',
+      when: 'Revision no longer matches.',
       recovery:
         'Restart the same tool without revision and begin at the first page to read one consistent record.',
       thrownBy: 'service',
@@ -99,7 +90,7 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
     {
       reason: 'upstream_identity_mismatch',
       code: JsonRpcErrorCode.SerializationError,
-      when: 'Detail identity or filter rows contradict required identity.',
+      when: 'Source rows contradict the required identity.',
       recovery:
         'Check party and constituency with riksdag_list_reference and retry riksdag_search_members; report repeated mismatches with the request identifier.',
       thrownBy: 'service',
@@ -107,14 +98,14 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
     {
       reason: 'upstream_schema_invalid',
       code: JsonRpcErrorCode.SerializationError,
-      when: 'Present payload violates wire contract.',
+      when: 'Payload violates the wire contract.',
       recovery: 'Retry the same tool later; report repeated failures with the request identifier.',
       thrownBy: 'service',
     },
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Network or service error after retries.',
+      when: 'Source unavailable after retries.',
       recovery:
         'Retry riksdag_search_members with the same filters after the source becomes available.',
       thrownBy: 'service',
@@ -122,14 +113,14 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
     {
       reason: 'upstream_queue_full',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'Process upstream queue is full.',
+      when: 'Upstream queue is full.',
       recovery: 'Wait before retrying the same tool, and request fewer simultaneous searches.',
       thrownBy: 'service',
     },
     {
       reason: 'candidate_limit_reached',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Complete-list safety boundary reached.',
+      when: 'Complete-list safety limit reached.',
       recovery:
         'Retry riksdag_search_members with a party filter from riksdag_list_reference; the complete register is too large for this selection.',
       thrownBy: 'service',
@@ -195,40 +186,30 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
       enrichment.notices.push(
         'No register entries matched these local filters. Retry riksdag_search_members with sitting all or fewer name tokens; use riksdag_list_reference for party and constituency codes.',
       );
-    const result = fitRows({
-      rows,
+    budget.check();
+    const items = rows.slice(filters.offset, filters.offset + filters.limit);
+    const hasMore = filters.offset + items.length < rows.length;
+    ctx.enrich(enrichment);
+    return {
+      items,
+      candidateCount: candidates.length,
+      sourceReportedCount: loaded.sourceReportedCount,
+      totalCount: rows.length,
+      returnedCount: items.length,
       offset: filters.offset,
       limit: filters.limit,
-      enrichment,
-      budget,
-      build: (items, limit, truncated) => {
-        const hasMore = filters.offset + items.length < rows.length;
-        return {
-          items,
-          candidateCount: candidates.length,
-          sourceReportedCount: loaded.sourceReportedCount,
-          totalCount: rows.length,
-          returnedCount: items.length,
-          offset: filters.offset,
-          limit,
-          requestedLimit: input.limit,
-          truncated,
-          revision,
-          hasMore,
-          ...(hasMore
-            ? {
-                nextCall: {
-                  toolName: 'riksdag_search_members' as const,
-                  args: { ...filters, limit, offset: filters.offset + items.length, revision },
-                },
-              }
-            : {}),
-        };
-      },
-    });
-    budget.check();
-    ctx.enrich(enrichment);
-    return result;
+      requestedLimit: input.limit,
+      revision,
+      hasMore,
+      ...(hasMore
+        ? {
+            nextCall: {
+              toolName: 'riksdag_search_members' as const,
+              args: { ...filters, offset: filters.offset + items.length, revision },
+            },
+          }
+        : {}),
+    };
   },
   format: formatExact,
 });

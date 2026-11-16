@@ -1,5 +1,5 @@
 /**
- * @fileoverview Lossless quoted-data rendering and effective-response measurement.
+ * @fileoverview Lossless quoted-data rendering and continuation schemas.
  * @module services/riksdag/output
  */
 import { z } from '@cyanheads/mcp-ts-core';
@@ -7,26 +7,37 @@ import { fromMarkdown } from 'mdast-util-from-markdown';
 
 /** Every success, including misses and cache hits, declares this enrichment shape. */
 export const successEnrichment = {
-  effectiveQuery: z
-    .string()
-    .describe('Deterministic normalized input, applied defaults and local filters.'),
+  effectiveQuery: z.string().describe('Normalized input, defaults and local filters.'),
   source: z.string().describe('Required attribution to the Swedish Parliament.'),
-  retrievedAt: z.string().describe('Source fetch time, retained unchanged on cache hits.'),
+  retrievedAt: z.string().describe('Source fetch time; unchanged on cache hits.'),
   notices: z
-    .array(z.string().describe('A source limitation, applied bound or next-step notice.'))
-    .describe('All applicable notices, including an empty list.'),
-  upstreamQuery: z
-    .string()
-    .optional()
-    .describe('Upstream query echo; not proof that a filter was applied.'),
+    .array(z.string().describe('A limitation, applied bound or next-step notice.'))
+    .describe('Applicable notices, possibly empty.'),
+  upstreamQuery: z.string().optional().describe('Upstream query echo, not proof a filter applied.'),
   upstreamWarnings: z
-    .array(z.string().describe('An upstream warning preserved verbatim.'))
+    .array(z.string().describe('An upstream warning, verbatim.'))
     .optional()
-    .describe('Warnings supplied by the source.'),
+    .describe('Source warnings.'),
 };
 
 /** Agent-facing success context is kept outside the handler domain result. */
 export type SuccessEnrichment = z.infer<z.ZodObject<typeof successEnrichment>>;
+
+/**
+ * Output shape of a continuation call. `args` is an open object rather than a restatement of
+ * the named tool's input schema, which would serialize that schema again into every output
+ * schema in `tools/list`; the values are still complete normalized arguments.
+ */
+export function toolCallSchema<const T extends string>(toolName: T) {
+  return z.object({
+    toolName: z.literal(toolName).describe('Tool to call next.'),
+    args: z
+      .looseObject({})
+      .describe(
+        `Complete normalized arguments for ${toolName}, valid against its input schema; pass back unchanged.`,
+      ),
+  });
+}
 
 function fence(json: string): string {
   const runs = json.match(/`+/g) ?? [];
@@ -104,21 +115,6 @@ export const successEnrichmentTrailer = {
       value === undefined ? '' : trailerField('upstreamWarnings', value),
   },
 };
-
-/** Measures actual JSON bytes across both success surfaces, including the framework trailer. */
-export function measureResponse(domain: unknown, enrichment: SuccessEnrichment): number {
-  if (domain === null || typeof domain !== 'object' || Array.isArray(domain))
-    throw new Error('Tool output must be an object.');
-  const fields = Object.entries(enrichment).map(([key, value]) =>
-    value === undefined ? '' : trailerField(key, value),
-  );
-  const content = [...formatExact(domain), { type: 'text', text: `\n\n${fields.join('\n')}` }];
-  const encoder = new TextEncoder();
-  return (
-    encoder.encode(JSON.stringify({ ...domain, ...enrichment })).byteLength +
-    encoder.encode(JSON.stringify(content)).byteLength
-  );
-}
 
 /** Stable query echo includes all normalized modes, defaults and local filter choices. */
 export function effectiveQuery(input: object): string {

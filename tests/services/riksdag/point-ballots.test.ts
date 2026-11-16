@@ -63,16 +63,8 @@ describe('complete ballot records', () => {
         { point: 1 },
         budget,
       );
+      // Ballots order by voteId, memberId, then avser, so member 00000's motivation ballot leads.
       expect(result.parties).toEqual([
-        {
-          party: 'S',
-          avser: 'sakfrågan',
-          yes: 190,
-          no: 127,
-          abstain: 0,
-          absent: 32,
-          otherVotes: [],
-        },
         {
           party: 'S',
           avser: 'motivfrågan',
@@ -82,12 +74,21 @@ describe('complete ballot records', () => {
           absent: 32,
           otherVotes: [],
         },
+        {
+          party: 'S',
+          avser: 'sakfrågan',
+          yes: 190,
+          no: 127,
+          abstain: 0,
+          absent: 32,
+          otherVotes: [],
+        },
       ]);
     } finally {
       service.dispose();
     }
   });
-  it('characterizes positive points and published date precision', async () => {
+  it('keeps positive points and the source timestamp without inventing a vote date', async () => {
     const service = new RiksdagService({
       fetch: async () =>
         Response.json({
@@ -103,9 +104,9 @@ describe('complete ballot records', () => {
     });
     using budget = createToolBudget();
     try {
-      expect(
-        (await loadMemberVotes(service, '2024/25', '0001', undefined, budget)).rows[0],
-      ).toMatchObject({ point: 1, date: '2025-01-02', systemDate: '2025-01-02 12:00:00' });
+      const row = (await loadMemberVotes(service, '2024/25', '0001', undefined, budget)).rows[0];
+      expect(row).toMatchObject({ point: 1, systemDate: '2025-01-02 12:00:00' });
+      expect(row).not.toHaveProperty('date');
     } finally {
       service.dispose();
     }
@@ -126,27 +127,41 @@ describe('complete ballot records', () => {
       service.dispose();
     }
   });
-  it('keeps shared vote/member IDs for distinct avser and counts each subject separately', async () => {
-    const rows = [ballot('sakfrågan'), ballot('motivfrågan', 'Nej')];
-    const service = new RiksdagService({
-      fetch: async () => Response.json({ voteringlista: { '@antal': '2', votering: rows } }),
-    });
-    using budget = createToolBudget();
-    try {
-      expect(
-        (await loadMemberVotes(service, '2024/25', '0001', undefined, budget)).rows.map(
-          (row) => row.avser,
-        ),
-      ).toEqual(['sakfrågan', 'motivfrågan']);
-      expect(
-        (await hydrateVotePoint(service, '2024/25', 'KU1', 'HC01KU1', { point: 1 }, budget))
-          .parties,
-      ).toEqual([
-        { party: 'S', avser: 'sakfrågan', yes: 1, no: 0, abstain: 0, absent: 0, otherVotes: [] },
-        { party: 'S', avser: 'motivfrågan', yes: 0, no: 1, abstain: 0, absent: 0, otherVotes: [] },
-      ]);
-    } finally {
-      service.dispose();
-    }
-  });
+  it.each([
+    ['substantive first', ['sakfrågan', 'motivfrågan']],
+    ['motivation first', ['motivfrågan', 'sakfrågan']],
+  ])(
+    'orders shared vote/member IDs by avser whatever the source order (%s) and counts each subject separately',
+    async (_, sourceOrder) => {
+      const rows = sourceOrder.map((avser) => ballot(avser, avser === 'sakfrågan' ? 'Ja' : 'Nej'));
+      const service = new RiksdagService({
+        fetch: async () => Response.json({ voteringlista: { '@antal': '2', votering: rows } }),
+      });
+      using budget = createToolBudget();
+      try {
+        expect(
+          (await loadMemberVotes(service, '2024/25', '0001', undefined, budget)).rows.map(
+            (row) => row.avser,
+          ),
+        ).toEqual(['motivfrågan', 'sakfrågan']);
+        expect(
+          (await hydrateVotePoint(service, '2024/25', 'KU1', 'HC01KU1', { point: 1 }, budget))
+            .parties,
+        ).toEqual([
+          {
+            party: 'S',
+            avser: 'motivfrågan',
+            yes: 0,
+            no: 1,
+            abstain: 0,
+            absent: 0,
+            otherVotes: [],
+          },
+          { party: 'S', avser: 'sakfrågan', yes: 1, no: 0, abstain: 0, absent: 0, otherVotes: [] },
+        ]);
+      } finally {
+        service.dispose();
+      }
+    },
+  );
 });

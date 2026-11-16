@@ -71,6 +71,7 @@ const summaryOutputCell = z
   .string()
   .nullable()
   .describe('Published cell text, preserving blank and zero; null means absent structured text.');
+/** Output-only; the id emits it once under `$defs` instead of inlining every reuse. */
 const summaryOutputRow = z
   .object({
     label: z.string().optional().describe('Published row heading.'),
@@ -78,8 +79,13 @@ const summaryOutputRow = z
       .array(summaryOutputCell)
       .describe('Ordered source cells; blank and zero values remain distinct.'),
   })
-  .describe('One published summary row.');
-/** Published singleton summary structure, shared by document and vote outputs. */
+  .describe('One published summary row.')
+  .meta({ id: 'RiksdagDecisionSummaryRow' });
+/**
+ * Published singleton summary structure, shared by document and vote outputs. Output-only: the
+ * id emits it once under `$defs`, and an id reachable from an input schema would leak `$ref`
+ * into `inputSchema`.
+ */
 export const documentSummarySchema = z
   .object({
     heading: z.string().optional().describe('Published heading of a historical summary.'),
@@ -105,7 +111,8 @@ export const documentSummarySchema = z
       .describe('Ordered published body rows when a body is available.'),
     footer: summaryOutputRow.optional().describe('Published totals row, when available.'),
   })
-  .describe('Published vote-summary table without HTML wrapper layers.');
+  .describe('Published vote-summary table without HTML wrapper layers.')
+  .meta({ id: 'RiksdagDecisionSummary' });
 function normalizeSummary(
   summary: string | z.infer<typeof summaryTable>,
 ): z.infer<typeof documentSummarySchema> {

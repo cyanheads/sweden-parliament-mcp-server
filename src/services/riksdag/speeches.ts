@@ -1,7 +1,7 @@
 /** @fileoverview Complete speech candidates and exact retrieval-ID detail. @module services/riksdag/speeches */
 import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { normalizeSpeechId } from './normalize.js';
+import { canonicalDocumentId, normalizeSpeechId } from './normalize.js';
 import type { RiksdagService } from './riksdag-service.js';
 import { htmlToMarkdown } from './text.js';
 import type { ToolBudget } from './transport.js';
@@ -62,7 +62,12 @@ export const speechSchema = z.object({
   subheading: z.string().optional().describe('Published debate subheading.'),
   activity: z.string().optional().describe('Published chamber activity.'),
   reply: z.boolean().optional().describe('Whether the source explicitly marks this as a reply.'),
-  relatedDocumentId: z.string().optional().describe('Source-linked related document ID.'),
+  relatedDocumentId: z
+    .string()
+    .optional()
+    .describe(
+      'Source-linked related document ID in canonical form, or a ", "-separated list for joint debates.',
+    ),
   sourceUrl: z.string().describe('Fixed-origin speech detail source link.'),
   sourceHtmlUrl: z.string().optional().describe('Published speech HTML link.'),
   protocolUrl: z.string().optional().describe('Published protocol link and speech anchor.'),
@@ -76,6 +81,19 @@ function identityMismatch(): never {
     'The source speech identity contradicts the requested identity.',
     { reason: 'upstream_identity_mismatch', retryable: false },
   );
+}
+
+/** Joint interpellation debates link several documents in one source `rel_dok_id` list. */
+const RELATED_SEPARATOR = ', ';
+
+/** Canonical document ID, or the source text of an element that is not one: a link never fails a search. */
+function relatedElement(element: string): string {
+  return canonicalDocumentId(element) ?? element;
+}
+
+/** Whether any element of a speech's related-document list equals this canonical document ID. */
+export function linksDocument(speech: Speech, documentId: string): boolean {
+  return speech.relatedDocumentId?.split(RELATED_SEPARATOR).includes(documentId) ?? false;
 }
 
 function normalize(row: z.output<typeof wireSpeech>): Speech {
@@ -112,7 +130,10 @@ function normalize(row: z.output<typeof wireSpeech>): Speech {
     subheading: row.underrubrik,
     activity: row.kammaraktivitet,
     reply: row.replik === 'Y' ? true : row.replik === 'N' ? false : undefined,
-    relatedDocumentId: row.rel_dok_id,
+    relatedDocumentId: row.rel_dok_id
+      ?.split(RELATED_SEPARATOR)
+      .map(relatedElement)
+      .join(RELATED_SEPARATOR),
     sourceHtmlUrl: row.anforande_url_html && sourceUrl(row.anforande_url_html),
     protocolUrl: row.protokoll_url_www && sourceUrl(row.protokoll_url_www),
   };

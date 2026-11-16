@@ -3,9 +3,14 @@
  * @module services/riksdag/votes
  */
 import { z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { documentDecisionSchema, loadDocumentStatus, resolveReport } from './documents.js';
-import { normalizeDocumentId, normalizeReport, normalizeSession } from './normalize.js';
+import {
+  canonicalDocumentId,
+  normalizeDocumentId,
+  normalizeReport,
+  normalizeSession,
+} from './normalize.js';
 import type { RiksdagService } from './riksdag-service.js';
 import { revisionOf } from './text.js';
 import type { ToolBudget } from './transport.js';
@@ -26,7 +31,6 @@ const memberWire = z.object({
   rm: z.string().min(1),
   beteckning: s,
   punkt: wireCount.optional(),
-  datum: s,
   systemdatum: s,
   namn: s,
   parti: s,
@@ -52,10 +56,19 @@ export const memberVoteSchema = z
     voteId: z.string().describe('Published main-vote identifier.'),
     memberId: z.string().describe('Numeric source member ID, retaining leading zeros.'),
     session: z.string().describe('Published parliamentary session.'),
-    report: z.string().optional().describe('Published committee-report designation.'),
+    report: z
+      .string()
+      .optional()
+      .describe(
+        'Published designation: a committee report, or on point-zero rows a vote designation such as 0118-1.',
+      ),
     point: z.number().int().positive().optional().describe('Published report point.'),
-    date: z.string().optional().describe('Vote date at source precision.'),
-    systemDate: z.string().optional().describe('Source system timestamp at published precision.'),
+    systemDate: z
+      .string()
+      .optional()
+      .describe(
+        'Source record timestamp at published precision; it orders member-mode rows and is not the vote date.',
+      ),
     name: z.string().optional().describe('Source-authored member name.'),
     party: z.string().optional().describe('Published party code for this vote.'),
     constituency: z.string().optional().describe('Published constituency.'),
@@ -69,7 +82,12 @@ export const memberVoteSchema = z
       .describe(
         'Whether the main vote concerns the substantive issue or motivation, as published.',
       ),
-    documentId: z.string().optional().describe('Published linked report document ID.'),
+    documentId: z
+      .string()
+      .optional()
+      .describe(
+        'Linked document ID, normalized as riksdag_get_document returns it; IDs outside that format keep their published spelling.',
+      ),
     sourceUrl: z.string().optional().describe('Published main-vote source link.'),
   })
   .describe('One published member main vote.');
@@ -242,30 +260,74 @@ function memberRows(
       session: sourceSession(row.rm),
       report: row.beteckning,
       ...(row.punkt ? { point: row.punkt } : {}),
-      date: row.datum,
       systemDate: row.systemdatum,
       name: row.namn,
       party: row.parti,
       constituency: row.valkrets,
       vote: row.rost,
       avser: row.avser,
-      documentId: row.dok_id,
+      // A linked ID outside the document grammar keeps its published spelling; a row never fails the call.
+      documentId:
+        row.dok_id === undefined ? undefined : (canonicalDocumentId(row.dok_id) ?? row.dok_id),
       ...(row.votering_url_xml ? { sourceUrl: sourceUrl(row.votering_url_xml) } : {}),
     }))
-    .sort((a, b) =>
-      `${a.voteId.toUpperCase()}:${a.memberId}`.localeCompare(
-        `${b.voteId.toUpperCase()}:${b.memberId}`,
-      ),
-    );
+    .sort(selection ? ballotOrder : memberOrder);
 }
 
-/** Acquires and validates the full bounded response before caching, revision or local filtering. */
+type VoteRow = z.infer<typeof memberVoteSchema>;
+
+/**
+ * Comparable spelling of a published row designation. Never `normalizeReport`: point-zero rows
+ * carry non-report designations such as `0118-1`.
+ */
+function designationKey(value: string | undefined): string | undefined {
+  return value?.normalize('NFC').toUpperCase();
+}
+
+/** Code-unit order, independent of runtime collation, so revisions agree across runtimes. */
+function compareText(a: string | undefined, b: string | undefined, absent: 'first' | 'last') {
+  if (a === b) return 0;
+  if (a === undefined) return absent === 'first' ? -1 : 1;
+  if (b === undefined) return absent === 'first' ? 1 : -1;
+  return a < b ? -1 : 1;
+}
+
+/**
+ * Source-timestamp order: `systemDate` (rows without one last), then report (by its comparable
+ * spelling), point (absent first), avser and voteId — total over the (voteId, memberId, avser)
+ * identity within one member. `systemDate` is the record's source timestamp, not the vote date.
+ */
+function memberOrder(a: VoteRow, b: VoteRow): number {
+  return (
+    compareText(a.systemDate, b.systemDate, 'last') ||
+    compareText(designationKey(a.report), designationKey(b.report), 'first') ||
+    (a.point ?? 0) - (b.point ?? 0) ||
+    compareText(a.avser, b.avser, 'first') ||
+    compareText(a.voteId.toUpperCase(), b.voteId.toUpperCase(), 'first')
+  );
+}
+
+/** One point's ballots: voteId, then memberId, with avser as the final identity tiebreak. */
+function ballotOrder(a: VoteRow, b: VoteRow): number {
+  return (
+    compareText(a.voteId.toUpperCase(), b.voteId.toUpperCase(), 'first') ||
+    compareText(a.memberId, b.memberId, 'first') ||
+    compareText(a.avser, b.avser, 'first')
+  );
+}
+
+/**
+ * Acquires and validates the full bounded response before caching, revision or local filtering.
+ * `selection.report` (a `normalizeReport` key) and its optional `point` narrow `rows` after the
+ * party filter; `candidateCount` and `revision` keep describing the member/session set.
+ */
 export async function loadMemberVotes(
   service: RiksdagService,
   session: string,
   memberId: string,
   party: string | undefined,
   budget: ToolBudget,
+  selection?: { report: string; point: number | undefined },
 ) {
   const loaded = await service.loadJson(
     {
@@ -286,11 +348,19 @@ export async function loadMemberVotes(
   const revision = await revisionOf(candidates);
   const upstreamQuery = queryEcho(root);
   budget.check();
+  const partyRows =
+    party === undefined
+      ? candidates
+      : candidates.filter((row) => row.party?.toUpperCase() === party.toUpperCase());
   return {
     rows:
-      party === undefined
-        ? candidates
-        : candidates.filter((row) => row.party?.toUpperCase() === party.toUpperCase()),
+      selection === undefined
+        ? partyRows
+        : partyRows.filter(
+            (row) =>
+              designationKey(row.report) === selection.report &&
+              (selection.point === undefined || row.point === selection.point),
+          ),
     candidateCount: candidates.length,
     revision,
     retrievedAt: loaded.retrievedAt,
@@ -299,7 +369,22 @@ export async function loadMemberVotes(
   };
 }
 
-/** Loads the authoritative full point catalog before any local page is selected. */
+/**
+ * A direct documentId names the record being compared, so its disagreement with the requested
+ * session or report is caller input. A report resolved from `report` never reaches these checks
+ * disagreeing: `resolveReport` already fails it as `upstream_identity_mismatch`.
+ */
+function selectionMismatch(message: string, hint: string): never {
+  throw validationError(message, { reason: 'invalid_filter', recovery: { hint } });
+}
+
+/**
+ * Loads the authoritative full point catalog before any local page is selected. The returned
+ * `report` is the published designation (`FöU1`) and `reportKey` its `normalizeReport` key. A
+ * direct documentId naming a non-report, another session's report or a report disagreeing with
+ * `report` throws `invalid_filter`; a status record missing type, session or designation stays
+ * `upstream_identity_mismatch`.
+ */
 export async function loadVoteReport(
   service: RiksdagService,
   session: string,
@@ -311,32 +396,42 @@ export async function loadVoteReport(
     ? await loadDocumentStatus(service, documentId, budget)
     : await resolveReport(service, session, report ?? '', budget);
   if (!loaded.found) return loaded;
-  const metadata = loaded.record.metadata;
-  if (
-    !metadata.session ||
-    sourceSession(metadata.session) !== session ||
-    metadata.documentType?.toLowerCase() !== 'bet' ||
-    !metadata.designation
-  )
-    identityFailure();
-  const designation = sourceReport(metadata.designation, session);
-  if (report && designation !== report) identityFailure();
+  const { documentType, session: publishedSession, designation } = loaded.record.metadata;
+  if (!documentType || !publishedSession || !designation) identityFailure();
+  const id = loaded.documentId;
+  if (documentType.toLowerCase() !== 'bet')
+    selectionMismatch(
+      `Document ${id} is a ${documentType} document, not a committee report (bet).`,
+      `Call riksdag_get_document with documentId ${id} and sections references to list the reports that treated it (behandlas_i), then retry riksdag_get_votes with one of their documentIds; otherwise use riksdag_search_documents with documentType "bet" and session ${session}.`,
+    );
+  const reportSession = sourceSession(publishedSession);
+  if (reportSession !== session)
+    selectionMismatch(
+      `Report ${id} belongs to session ${reportSession}, not ${session}.`,
+      `Retry riksdag_get_votes with session ${reportSession} and the same documentId ${id}.`,
+    );
+  const reportKey = sourceReport(designation, session);
+  if (report && reportKey !== report)
+    selectionMismatch(
+      `Report ${id} is report ${designation}, not ${report}.`,
+      `Pass report or documentId alone: documentId ${id} selects report ${designation}.`,
+    );
   const decisions = [...loaded.record.decisions].sort((a, b) => a.point - b.point);
   for (const decision of decisions) {
     if (
       (decision.session && sourceSession(decision.session) !== session) ||
-      (decision.report && sourceReport(decision.report, session) !== designation)
+      (decision.report && sourceReport(decision.report, session) !== reportKey)
     )
       identityFailure();
   }
   const revision = await revisionOf({
     documentId: loaded.documentId,
     session,
-    report: designation,
+    report: reportKey,
     decisions,
   });
   budget.check();
-  return { ...loaded, report: designation, decisions, revision };
+  return { ...loaded, report: designation, reportKey, decisions, revision };
 }
 
 function pointRows(
@@ -441,7 +536,7 @@ function aggregateBallots(rows: readonly z.infer<typeof memberVoteSchema>[]) {
   });
 }
 
-/** Hydrates one whole point; caller retains every hydrated point even if it exceeds the target. */
+/** Hydrates one whole point from its complete published ballots, loading them unless supplied. */
 export async function hydrateVotePoint(
   service: RiksdagService,
   session: string,

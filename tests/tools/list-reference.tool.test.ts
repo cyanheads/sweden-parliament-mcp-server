@@ -38,6 +38,7 @@ describe('riksdag_list_reference', () => {
         args: { topic, offset: returned, limit: 3 },
       });
       input = listReference.input.parse(page.nextCall?.args);
+      expect(input).toEqual(page.nextCall?.args);
     }
     expect(returned).toBeGreaterThan(0);
   });
@@ -53,10 +54,41 @@ describe('riksdag_list_reference', () => {
       requestedLimit: 101,
       returnedCount: 0,
       hasMore: false,
-      truncated: false,
     });
+    expect(page).not.toHaveProperty('truncated');
     expect(page.nextCall).toBeUndefined();
   });
+  it.each([
+    [100, 100],
+    [101, 100],
+  ])(
+    'returns min(limit %i, remaining) document types and continues with the applied %i',
+    async (limit, applied) => {
+      const page = await listReference.handler(
+        listReference.input.parse({ topic: 'document_types', limit }),
+        createMockContext(),
+      );
+      expect(page).toMatchObject({
+        totalCount: 132,
+        returnedCount: applied,
+        limit: applied,
+        requestedLimit: limit,
+        hasMore: true,
+      });
+      expect(page.entries).toHaveLength(applied);
+      expect(page).not.toHaveProperty('truncated');
+      expect(page.nextCall).toEqual({
+        toolName: 'riksdag_list_reference',
+        args: { topic: 'document_types', offset: applied, limit: applied },
+      });
+      const rest = await listReference.handler(
+        listReference.input.parse(page.nextCall?.args),
+        createMockContext(),
+      );
+      expect(rest).toMatchObject({ offset: applied, returnedCount: 32, hasMore: false });
+      expect(rest.nextCall).toBeUndefined();
+    },
+  );
   it('rejects unknown topics, non-integer offsets and impossible limits', () => {
     for (const args of [
       { topic: 'other' },

@@ -7,6 +7,7 @@ import {
   searchDocuments,
 } from '../../../services/riksdag/documents.js';
 import {
+  formatString,
   normalizeCode,
   normalizeDateRange,
   normalizeMemberId,
@@ -19,8 +20,8 @@ import {
   type SuccessEnrichment,
   successEnrichment,
   successEnrichmentTrailer,
+  toolCallSchema,
 } from '../../../services/riksdag/output.js';
-import { fitRows } from '../../../services/riksdag/pagination.js';
 import { getRiksdagService } from '../../../services/riksdag/riksdag-service.js';
 import { assertRevision, revisionOf } from '../../../services/riksdag/text.js';
 import { createToolBudget } from '../../../services/riksdag/transport.js';
@@ -34,67 +35,62 @@ const argsSchema = z.object({
     .string()
     .optional()
     .describe('Document type code or exact reference label, including sfs.'),
-  session: z
-    .string()
+  session: formatString('session', { blank: true })
     .optional()
-    .describe('Parliamentary session; omission searches all available sessions.'),
+    .describe('Parliamentary session; omit to search all sessions.'),
   committee: z.string().optional().describe('Committee code or exact reference label.'),
   party: z.string().optional().describe('Party code or exact reference label.'),
-  memberId: z
-    .string()
+  memberId: formatString('memberId', { blank: true })
     .optional()
-    .describe('Numeric member IID from riksdag_search_members; leading zeros are preserved.'),
+    .describe('Numeric member IID from riksdag_search_members, keeping leading zeros.'),
   sort: z
     .enum(['relevance', 'date'])
     .optional()
-    .describe('Source ordering; relevance for nonblank queries and descending date otherwise.'),
+    .describe('Source order: relevance for a nonblank query, else descending date.'),
   offset: z
     .number()
     .int()
     .min(0)
     .default(0)
-    .describe('In-page row offset; follow nextCall without changing the remote page size.'),
+    .describe('In-page row offset; follow nextCall, keeping the remote page size.'),
   revision: z
     .string()
     .optional()
-    .describe('Remote-page revision from continuation; rejects changed pages.'),
-  dateFrom: z.string().optional().describe('Inclusive earliest ISO calendar date, YYYY-MM-DD.'),
-  dateTo: z.string().optional().describe('Inclusive latest ISO calendar date, YYYY-MM-DD.'),
+    .describe('Remote-page revision from nextCall; a changed page is rejected.'),
+  dateFrom: formatString('date', { blank: true, field: 'dateFrom' })
+    .optional()
+    .describe('Inclusive start date, YYYY-MM-DD.'),
+  dateTo: formatString('date', { blank: true, field: 'dateTo' })
+    .optional()
+    .describe('Inclusive end date, YYYY-MM-DD.'),
   page: z.number().int().min(1).default(1).describe('Remote page number, starting at 1.'),
   pageSize: z
     .number()
     .int()
     .min(1)
     .default(10)
-    .describe('Requested remote page size; maximum applied size 50.'),
+    .describe('Remote page size; clamped to a maximum of 50.'),
 });
-/** Search source-ranked pages using revision-checked whole-row continuation. */
+/** Search source-ranked remote pages with revision-checked continuation. */
 export const riksdagSearchDocuments = tool('riksdag_search_documents', {
   title: 'Search parliamentary documents',
   description:
-    'Search Swedish parliamentary documents and consolidated SFS statutes by words, document type, session, committee, party, member IID or dates. Choose relevance or descending date ordering and follow complete continuation calls. Read document status and text with riksdag_get_document.',
+    'Search Swedish parliamentary documents and consolidated SFS statutes by words, type, session, committee, party, member IID or dates, ordered by relevance or descending date. Follow nextCall for further pages; read status and text with riksdag_get_document.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: argsSchema,
   output: z.object({
-    items: z
-      .array(documentMetadataSchema)
-      .describe('Complete rows selected from the fetched remote page.'),
+    items: z.array(documentMetadataSchema).describe('Whole rows from the fetched remote page.'),
     page: z.number().describe('Applied remote page.'),
     pageSize: z.number().describe('Applied remote page size.'),
-    returnedCount: z.number().describe('Actual rows returned.'),
+    returnedCount: z.number().describe('Rows returned.'),
     offset: z.number().describe('Applied in-page row offset.'),
-    remoteReturnedCount: z.number().describe('Complete fetched remote-page row count.'),
-    revision: z.string().describe('Hash of the complete normalized remote page.'),
-    truncated: z.boolean().describe('Whether response fitting shortened this local page.'),
+    remoteReturnedCount: z.number().describe('Row count of the fetched remote page.'),
+    revision: z.string().describe('Hash of the complete remote page.'),
     totalCount: z.number().optional().describe('Authoritative source hit count, when published.'),
     hasMore: z.boolean().describe('Whether local rows or another remote page remain.'),
-    nextCall: z
-      .object({
-        toolName: z.literal('riksdag_search_documents').describe('Tool to call next.'),
-        args: argsSchema.describe('Complete normalized next-page arguments.'),
-      })
+    nextCall: toolCallSchema('riksdag_search_documents')
       .optional()
-      .describe('Complete next-page call with unchanged filters and page size.'),
+      .describe('Next-page call with unchanged filters and page size.'),
   }),
   enrichment: successEnrichment,
   enrichmentTrailer: successEnrichmentTrailer,
@@ -102,7 +98,7 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
     {
       reason: 'revision_changed',
       code: JsonRpcErrorCode.Conflict,
-      when: 'The remote page changed between continuation calls.',
+      when: 'The remote page changed between calls.',
       recovery:
         'Restart this page at offset zero without revision to read one consistent remote page.',
       thrownBy: 'service',
@@ -110,7 +106,7 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Unknown code or malformed date or session.',
+      when: 'Unknown code, nonconsecutive session, impossible date or reversed date range.',
       recovery:
         'Use riksdag_list_reference to check codes and identifier formats, then retry the same tool with corrected filters.',
       thrownBy: 'service',
@@ -118,7 +114,7 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
     {
       reason: 'upstream_identity_mismatch',
       code: JsonRpcErrorCode.SerializationError,
-      when: 'Source rows contradict required filter identities.',
+      when: 'Source rows contradict the filter identities.',
       recovery:
         'Check document type, session and committee with riksdag_list_reference and retry riksdag_search_documents; report repeated mismatches with the request identifier.',
       thrownBy: 'service',
@@ -126,14 +122,14 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
     {
       reason: 'upstream_schema_invalid',
       code: JsonRpcErrorCode.SerializationError,
-      when: 'Present payload violates the wire contract.',
+      when: 'Payload violates the wire contract.',
       recovery: 'Retry the same tool later; report repeated failures with the request identifier.',
       thrownBy: 'service',
     },
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The source remains unavailable after retries.',
+      when: 'Source unavailable after retries.',
       recovery:
         'Retry riksdag_search_documents after the source becomes available; add session or documentType to narrow a slow query.',
       thrownBy: 'service',
@@ -141,7 +137,7 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
     {
       reason: 'upstream_queue_full',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'The process upstream queue is full.',
+      when: 'Upstream queue is full.',
       recovery: 'Wait before retrying the same tool, and request fewer simultaneous searches.',
       thrownBy: 'service',
     },
@@ -189,41 +185,27 @@ export const riksdagSearchDocuments = tool('riksdag_search_documents', {
       enrichment.notices.push(
         'The in-page offset is beyond the available rows; this is an empty terminal page.',
       );
-    const output = fitRows({
-      rows: domain.items,
-      offset: input.offset,
-      limit: filters.pageSize,
-      enrichment,
-      budget,
-      build: (items, _limit, truncated) => {
-        const nextOffset = input.offset + items.length;
-        const localMore = nextOffset < domain.items.length;
-        const hasMore = localMore || (nextOffset <= domain.items.length && domain.hasMore);
-        return {
-          ...domain,
-          items,
-          returnedCount: items.length,
-          remoteReturnedCount: domain.items.length,
-          offset: input.offset,
-          revision,
-          truncated,
-          hasMore,
-          ...(hasMore
-            ? {
-                nextCall: {
-                  toolName: 'riksdag_search_documents' as const,
-                  args: localMore
-                    ? { ...filters, offset: nextOffset, revision }
-                    : { ...filters, page: filters.page + 1, offset: 0 },
-                },
-              }
-            : {}),
-        };
-      },
-    });
+    const items = domain.items.slice(input.offset);
+    const hasMore = input.offset <= domain.items.length && domain.hasMore;
     budget.check();
     ctx.enrich(enrichment);
-    return output;
+    return {
+      ...domain,
+      items,
+      returnedCount: items.length,
+      remoteReturnedCount: domain.items.length,
+      offset: input.offset,
+      revision,
+      hasMore,
+      ...(hasMore
+        ? {
+            nextCall: {
+              toolName: 'riksdag_search_documents' as const,
+              args: { ...filters, page: filters.page + 1, offset: 0 },
+            },
+          }
+        : {}),
+    };
   },
   format: formatExact,
 });

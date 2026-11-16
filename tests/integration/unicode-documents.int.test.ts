@@ -53,7 +53,9 @@ describe('Swedish document identifiers', () => {
     expect(result.structuredContent).toMatchObject({
       returnedCount: 50,
       pageSize: 50,
-      items: expect.arrayContaining([expect.objectContaining({ documentId: 'HC01FÖU9' })]),
+      items: expect.arrayContaining([
+        expect.objectContaining({ documentId: 'HC01FÖU9', designation: 'FöU9' }),
+      ]),
     });
     expect(result.content).toEqual(
       expect.arrayContaining([
@@ -78,6 +80,9 @@ describe('Swedish document identifiers', () => {
     const detail = await runToolContract(riksdagGetDocument, { documentId: 'hc01fo\u0308u9' });
     expect(detail.isError).not.toBe(true);
     expect(detail.structuredContent).toMatchObject({ found: true, documentId: 'HC01FÖU9' });
+    expect(detail.structuredContent).toMatchObject({
+      metadata: { documentId: 'HC01FÖU9', designation: 'FöU9' },
+    });
     const votes = await runToolContract(riksdagGetVotes, {
       mode: 'report',
       session: '2024/25',
@@ -87,7 +92,7 @@ describe('Swedish document identifiers', () => {
     expect(votes.structuredContent).toMatchObject({
       found: true,
       documentId: 'HC01FÖU9',
-      report: 'FÖU9',
+      report: 'FöU9',
       pointTotalCount: 0,
     });
     expect(paths).toContain('/dokumentstatus/HC01FÖU9.json');

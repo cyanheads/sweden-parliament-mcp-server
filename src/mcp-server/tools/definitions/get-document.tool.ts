@@ -12,27 +12,22 @@ import {
   documentStakeholderSchema,
   loadDocumentStatus,
 } from '../../../services/riksdag/documents.js';
-import { normalizeDocumentId, optionalString } from '../../../services/riksdag/normalize.js';
+import {
+  formatString,
+  normalizeDocumentId,
+  optionalString,
+} from '../../../services/riksdag/normalize.js';
 import {
   effectiveQuery,
   formatExact,
-  measureResponse,
   type SuccessEnrichment,
   successEnrichment,
   successEnrichmentTrailer,
+  toolCallSchema,
 } from '../../../services/riksdag/output.js';
-import {
-  fitRows,
-  fitTextPages,
-  RESPONSE_TARGET_BYTES,
-  type TextPageSource,
-} from '../../../services/riksdag/pagination.js';
+import { pageTexts, type TextPageSource } from '../../../services/riksdag/pagination.js';
 import { getRiksdagService } from '../../../services/riksdag/riksdag-service.js';
-import {
-  assertRevision,
-  codePointLength,
-  sliceCodePoints,
-} from '../../../services/riksdag/text.js';
+import { assertRevision, codePointLength } from '../../../services/riksdag/text.js';
 import { createToolBudget } from '../../../services/riksdag/transport.js';
 
 const sectionKeys = [
@@ -58,15 +53,16 @@ const arrayKeys = [
   'stakeholders',
 ] as const;
 const inputSchema = z.object({
-  documentId: z
-    .string()
+  documentId: formatString('documentId', { blank: false })
     .min(1)
-    .describe('Document ID from riksdag_search_documents, or unambiguous SFS YYYY:N identifier.'),
+    .describe(
+      'Document ID from riksdag_search_documents or a member vote row, or an SFS YYYY:N identifier.',
+    ),
   sections: z
-    .array(z.string())
+    .array(sectionSchema)
     .optional()
     .describe(
-      'Select metadata, decisions, reservations, activities, properties, attachments, references, stakeholders, text or source_html. Omit for metadata, complete outline and first text page.',
+      'Sections to return. Omit for metadata, outline and first text page; [] returns only the outline.',
     ),
   textOffset: z.number().int().min(0).default(0).describe('Text offset in Unicode code points.'),
   textLength: z
@@ -74,9 +70,7 @@ const inputSchema = z.object({
     .int()
     .min(1)
     .optional()
-    .describe(
-      'Explicit text length in code points; defaults start at 8000 and fit the complete response; explicit lengths are honored.',
-    ),
+    .describe('Text page length in Unicode code points; default 8000.'),
   htmlOffset: z
     .number()
     .int()
@@ -88,41 +82,32 @@ const inputSchema = z.object({
     .int()
     .min(1)
     .optional()
-    .describe(
-      'Explicit source HTML length in code points; defaults start at 8000 and fit the complete response; explicit lengths are honored.',
-    ),
+    .describe('Source HTML page length in Unicode code points; default 8000.'),
   sectionOffset: z
     .number()
     .int()
     .min(0)
     .default(0)
-    .describe('Offset applied independently to each selected array section.'),
+    .describe('Entry offset for each selected array section.'),
   sectionLimit: z
     .number()
     .int()
     .min(1)
     .default(20)
-    .describe('Requested entries per selected array section; applied maximum 100.'),
+    .describe('Entries per selected array section; clamped to a maximum of 100.'),
   revision: z
     .string()
     .optional()
-    .describe('Revision returned by a previous call; rejects changed records.'),
+    .describe('Revision from a previous call; a changed record is rejected.'),
 });
-const nextCallSchema = z
-  .object({
-    toolName: z.literal('riksdag_get_document').describe('Tool to call next.'),
-    args: inputSchema.describe('Complete normalized continuation arguments.'),
-  })
-  .describe('Complete document continuation call.');
+const nextCallSchema = toolCallSchema('riksdag_get_document');
 const outputSchema = z.object({
   found: z.boolean().describe('Whether the source record exists.'),
   documentId: z.string().describe('Normalized document identifier.'),
   truncated: z
     .boolean()
     .optional()
-    .describe(
-      'At least one selected array section has more entries or a response-fitted page; follow its sectionPages continuation.',
-    ),
+    .describe('A selected array section has more entries; follow its sectionPages nextCall.'),
   guidance: z.string().optional().describe('How to resolve a missing identifier.'),
   revision: z.string().optional().describe('Hash of the complete normalized record.'),
   outline: z
@@ -132,15 +117,17 @@ const outputSchema = z.object({
           section: sectionSchema.describe('Selectable section key.'),
           available: z.boolean().describe('Whether the source publishes this section.'),
           itemCount: z.number().optional().describe('Complete section entry count.'),
-          textLength: z
-            .number()
-            .optional()
-            .describe('Complete text length in Unicode code points.'),
+          textLength: z.number().optional().describe('Total text length in code points.'),
         })
-        .describe('One section and its complete available size.'),
+        .describe('One section and its size.'),
     )
     .optional()
-    .describe('Every selectable section and its complete size.'),
+    .describe('Every selectable section with its size.'),
+  relatedSpeechesCall: toolCallSchema('riksdag_search_speeches')
+    .optional()
+    .describe(
+      'Speech search for the speeches the source links to this report (bet) or interpellation (ip); present when the record has a session. A resumed debate’s later segments can lack the link, and it can return none.',
+    ),
   metadata: documentMetadataSchema.optional().describe('Source publication metadata and links.'),
   decisions: z
     .array(documentDecisionSchema)
@@ -160,51 +147,48 @@ const outputSchema = z.object({
   stakeholders: z
     .array(documentStakeholderSchema)
     .optional()
-    .describe('Selected page of source participants, retaining entries without an IID.'),
+    .describe('Selected source participants, including those without an IID.'),
   sectionPages: z
     .array(
       z
         .object({
           section: z.enum(arrayKeys).describe('Selected array section.'),
-          totalCount: z.number().describe('Complete entry count in this section.'),
+          totalCount: z.number().describe('Total entries in this section.'),
           offset: z.number().describe('Applied entry offset.'),
-          limit: z.number().describe('Applied page limit after response fitting.'),
-          requestedLimit: z.number().describe('Original requested section limit.'),
-          truncated: z.boolean().describe('Whether response fitting shortened this section page.'),
-          returnedCount: z.number().describe('Actual returned section entries.'),
-          hasMore: z.boolean().describe('Whether entries remain after this section page.'),
-          nextCall: nextCallSchema
-            .optional()
-            .describe('Complete continuation for this section only.'),
+          limit: z.number().describe('Applied section limit, maximum 100.'),
+          requestedLimit: z.number().describe('Requested section limit.'),
+          returnedCount: z.number().describe('Entries returned.'),
+          hasMore: z.boolean().describe('Whether entries remain.'),
+          nextCall: nextCallSchema.optional().describe('Continuation for this section only.'),
         })
-        .describe('Independent pagination for one selected section.'),
+        .describe('Pagination for one selected section.'),
     )
     .optional()
-    .describe('Independent counts and complete continuation for every selected array.'),
+    .describe('Counts and continuation for each selected array section.'),
   textAvailable: z.boolean().optional().describe('Whether a published canonical body exists.'),
   textRepresentation: z
     .enum(['source_text', 'markdown'])
     .optional()
     .describe('Source SFS text or canonical converted Markdown.'),
-  text: z.string().optional().describe('Selected canonical text page, unchanged on both surfaces.'),
-  textOffset: z.number().optional().describe('Returned text offset in Unicode code points.'),
-  textTotalLength: z.number().optional().describe('Complete canonical text length in code points.'),
-  textReturnedLength: z.number().optional().describe('Actual returned text code points.'),
+  text: z.string().optional().describe('Canonical text page, identical on both surfaces.'),
+  textOffset: z.number().optional().describe('Returned text offset, code points.'),
+  textTotalLength: z.number().optional().describe('Total canonical text length, code points.'),
+  textReturnedLength: z.number().optional().describe('Returned text code points.'),
   textHasMore: z.boolean().optional().describe('Whether canonical text remains.'),
-  nextTextCall: nextCallSchema.optional().describe('Complete continuation for canonical text.'),
-  sourceHtml: z.string().optional().describe('Separately selected original source HTML page.'),
-  htmlOffset: z.number().optional().describe('Returned HTML offset in code points.'),
-  htmlTotalLength: z.number().optional().describe('Complete HTML code-point length.'),
+  nextTextCall: nextCallSchema.optional().describe('Continuation for canonical text.'),
+  sourceHtml: z.string().optional().describe('Original source HTML page, selected separately.'),
+  htmlOffset: z.number().optional().describe('Returned HTML offset, code points.'),
+  htmlTotalLength: z.number().optional().describe('Total HTML length, code points.'),
   htmlReturnedLength: z.number().optional().describe('Returned HTML code points.'),
   htmlHasMore: z.boolean().optional().describe('Whether source HTML remains.'),
-  nextHtmlCall: nextCallSchema.optional().describe('Complete continuation for source HTML.'),
+  nextHtmlCall: nextCallSchema.optional().describe('Continuation for source HTML.'),
 });
 
 /** Retrieve complete source sections and individually traversable text representations. */
 export const riksdagGetDocument = tool('riksdag_get_document', {
   title: 'Read parliamentary document',
   description:
-    'Read a document status, decisions, linked records and text. Select sections and follow complete continuation calls to read long reports or consolidated SFS statutes. SFS text is consolidated published text, not a point-in-time legal version.',
+    'Read a document status, decisions, linked records and text. Select sections and follow continuation calls to read long reports or consolidated SFS statutes. For a committee report or interpellation, relatedSpeechesCall searches the speeches the source links to it (a resumed debate’s later segments can lack the link). SFS text is consolidated published text, not a point-in-time legal version.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: inputSchema,
   output: outputSchema,
@@ -214,7 +198,7 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A malformed document identifier is supplied.',
+      when: 'An identifier that passes the input pattern is not a valid ID after NFC normalization.',
       recovery:
         'Use riksdag_list_reference to check codes and identifier formats, then retry the same tool with corrected filters.',
       thrownBy: 'service',
@@ -222,17 +206,10 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
     {
       reason: 'revision_changed',
       code: JsonRpcErrorCode.Conflict,
-      when: 'The source record changed between continuation calls.',
+      when: 'The source record changed between calls.',
       recovery:
         'Restart the same tool without revision and begin at the first page to read one consistent record.',
       thrownBy: 'service',
-    },
-    {
-      reason: 'unknown_section',
-      code: JsonRpcErrorCode.ValidationError,
-      when: 'A selected document section is unrecognized.',
-      recovery:
-        'Call riksdag_get_document without sections to read the outline, then select a listed section.',
     },
     {
       reason: 'upstream_identity_mismatch',
@@ -245,14 +222,14 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
     {
       reason: 'upstream_schema_invalid',
       code: JsonRpcErrorCode.SerializationError,
-      when: 'Present payload violates the wire contract.',
+      when: 'Payload violates the wire contract.',
       recovery: 'Retry the same tool later; report repeated failures with the request identifier.',
       thrownBy: 'service',
     },
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The source remains unavailable after retries.',
+      when: 'Source unavailable after retries.',
       recovery:
         'Retry riksdag_get_document with the same documentId after the source becomes available.',
       thrownBy: 'service',
@@ -260,7 +237,7 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
     {
       reason: 'upstream_queue_full',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'The process upstream queue is full.',
+      when: 'Upstream queue is full.',
       recovery: 'Wait before retrying the same tool, and request fewer simultaneous searches.',
       thrownBy: 'service',
     },
@@ -269,9 +246,6 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
     using budget = createToolBudget(ctx.signal);
     const documentId = normalizeDocumentId(input.documentId);
     const selected = input.sections ?? ['metadata', 'text'];
-    for (const key of selected)
-      if (!sectionSchema.safeParse(key).success)
-        throw ctx.fail('unknown_section', `Unknown document section: ${key}`);
     const revision = optionalString(input.revision);
     const args = {
       ...input,
@@ -300,6 +274,8 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
     const record = loaded.record;
     assertRevision(revision, record.revision);
     const continuationArgs = { ...args, revision: record.revision };
+    const { documentType, session } = record.metadata;
+    const debated = session !== undefined && ['bet', 'ip'].includes(documentType ?? '');
     const output: z.infer<typeof outputSchema> = {
       found: true,
       documentId,
@@ -321,6 +297,14 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
           itemCount: record[section].length,
         };
       }),
+      ...(debated
+        ? {
+            relatedSpeechesCall: {
+              toolName: 'riksdag_search_speeches' as const,
+              args: { session, relatedDocumentId: documentId },
+            },
+          }
+        : {}),
       textAvailable: record.text !== undefined,
     };
     if (selected.includes('metadata')) output.metadata = record.metadata;
@@ -331,49 +315,36 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
     output.sectionPages = [];
     for (const section of arrayKeys) {
       if (!selected.includes(section)) continue;
+      budget.check();
       const rows = record[section];
-      const page = fitRows<(typeof rows)[number], z.infer<typeof outputSchema>>({
-        rows,
+      const entries = rows.slice(args.sectionOffset, args.sectionOffset + args.sectionLimit);
+      const hasMore = args.sectionOffset + entries.length < rows.length;
+      Object.assign(output, { [section]: entries });
+      output.sectionPages.push({
+        section,
+        totalCount: rows.length,
         offset: args.sectionOffset,
         limit: args.sectionLimit,
-        enrichment,
-        budget,
-        build: (entries, appliedLimit, truncated) => {
-          const hasMore = args.sectionOffset + entries.length < rows.length;
-          const pagination = {
-            section,
-            totalCount: rows.length,
-            offset: args.sectionOffset,
-            limit: appliedLimit,
-            requestedLimit: input.sectionLimit,
-            truncated,
-            returnedCount: entries.length,
-            hasMore,
-            ...(hasMore
-              ? {
-                  nextCall: {
-                    toolName: 'riksdag_get_document' as const,
-                    args: {
-                      ...continuationArgs,
-                      sections: [section],
-                      sectionOffset: args.sectionOffset + entries.length,
-                    },
-                  },
-                }
-              : {}),
-          };
-          return {
-            ...output,
-            [section]: entries,
-            sectionPages: [...(output.sectionPages ?? []), pagination],
-          };
-        },
+        requestedLimit: input.sectionLimit,
+        returnedCount: entries.length,
+        hasMore,
+        ...(hasMore
+          ? {
+              nextCall: {
+                toolName: 'riksdag_get_document' as const,
+                args: {
+                  ...continuationArgs,
+                  sections: [section],
+                  sectionOffset: args.sectionOffset + entries.length,
+                },
+              },
+            }
+          : {}),
       });
-      Object.assign(output, page);
       if (args.sectionOffset > rows.length)
         enrichment.notices.push(`Section ${section} offset is beyond its available entries.`);
     }
-    output.truncated = output.sectionPages.some((page) => page.hasMore || page.truncated);
+    output.truncated = output.sectionPages.some((page) => page.hasMore);
     const textSources: (TextPageSource & { section: 'text' | 'source_html' })[] = [];
     if (selected.includes('text')) {
       output.textRepresentation = record.textRepresentation;
@@ -444,53 +415,9 @@ export const riksdagGetDocument = tool('riksdag_get_document', {
       }
       return result;
     };
-    const minimumText = textSources.map((source) => {
-      const totalLength = codePointLength(source.text);
-      return {
-        source,
-        totalLength,
-        text: sliceCodePoints(source.text, source.offset, 1),
-        returnedLength: source.offset < totalLength ? 1 : 0,
-      };
-    });
-    while (measureResponse(buildTextPages(minimumText), enrichment) > RESPONSE_TARGET_BYTES) {
-      budget.check();
-      const page = output.sectionPages
-        .filter((entry) => entry.returnedCount > 1)
-        .sort((left, right) => right.returnedCount - left.returnedCount)[0];
-      if (!page) break;
-      const entries = record[page.section].slice(page.offset, page.offset + page.returnedCount - 1);
-      Object.assign(output, { [page.section]: entries });
-      page.returnedCount = entries.length;
-      page.limit = entries.length;
-      page.truncated = true;
-      page.hasMore = true;
-      page.nextCall = {
-        toolName: 'riksdag_get_document',
-        args: {
-          ...continuationArgs,
-          sections: [page.section],
-          sectionOffset: page.offset + entries.length,
-        },
-      };
-      output.truncated = true;
-      const notice =
-        'The selected array pages were shortened to fit the complete response; follow each section continuation for remaining entries.';
-      if (!enrichment.notices.includes(notice)) enrichment.notices.push(notice);
-    }
-    const fitted = fitTextPages({
-      sources: textSources,
-      enrichment,
-      budget,
-      build: buildTextPages,
-    });
-    if (measureResponse(fitted, enrichment) > RESPONSE_TARGET_BYTES)
-      enrichment.notices.push(
-        'Selected document data exceeds the response target and is returned intact. Select fewer sections or follow individual section continuation calls.',
-      );
-    budget.check();
+    const paged = pageTexts({ sources: textSources, enrichment, budget, build: buildTextPages });
     ctx.enrich(enrichment);
-    return fitted;
+    return paged;
   },
   format: formatExact,
 });
