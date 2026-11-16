@@ -2539,19 +2539,19 @@ export const REFERENCE_TABLES: Readonly<Record<ReferenceTopic, readonly Referenc
       code: 'documentId',
       labelSv: 'Dokument-id',
       explanation:
-        'Copy the document ID from document search; ordinary IDs are case-insensitive and normalized to uppercase. A report designation is not a document ID.',
+        'Copy the document ID from document search. Input matching is case-insensitive; every output field returns a document ID in one normalized spelling, ordinary IDs in uppercase (HC01FÖU1). Vote records linked from point-zero member votes have hyphenated IDs, also uppercase (H6190118-1). A report designation is not a document ID.',
     },
     {
       code: 'sfs',
       labelSv: 'SFS-nummer',
       explanation:
-        'sfs-2000-100, SFS 2000:100 and 2000:100 resolve to sfs-2000-100. Published text is consolidated, not a point-in-time legal version.',
+        'sfs-2000-100, SFS 2000:100 and 2000:100 resolve to sfs-2000-100; N-prefixed numbers sfs-N2026-7, SFS N2026:7 and N2026:7 resolve to sfs-N2026-7. Published text is consolidated, not a point-in-time legal version.',
     },
     {
       code: 'report',
       labelSv: 'Betänkandebeteckning',
       explanation:
-        'Use a report designation such as KU1, optionally prefixed with session (2025/26:KU1). The prefix must agree with the session filter.',
+        'Use a report designation such as KU1, optionally prefixed with session (2025/26:KU1). The prefix must agree with the session filter. Input matching is case-insensitive; designations are returned as published (FöU1), while the report document ID is normalized (HC01FÖU1).',
     },
     {
       code: 'memberId',

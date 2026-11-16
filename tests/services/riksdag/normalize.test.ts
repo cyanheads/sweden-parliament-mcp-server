@@ -14,6 +14,7 @@ import {
   normalizeTokens,
   optionalString,
 } from '@/services/riksdag/normalize.js';
+import { REFERENCE_TABLES } from '@/services/riksdag/reference-data.js';
 
 describe('source identifiers and filters', () => {
   it.each(['sfs-2000-100', 'SFS 2000:100', '2000:100'])(
@@ -90,5 +91,128 @@ describe('source identifiers and filters', () => {
     expect(isReferenceTopic('coverage')).toBe(true);
     expect(isReferenceTopic('constructor')).toBe(false);
     expect(isReferenceTopic('__proto__')).toBe(false);
+  });
+});
+
+describe('rare identifier forms', () => {
+  it.each([
+    ['hc01föu9', 'HC01FÖU9'],
+    ['HC01FÅU1', 'HC01FÅU1'],
+    ['HC01FKU1', 'HC01FKU1'],
+    ['HC01FÅU1', 'HC01FÅU1'],
+    ['HC01FſU1', 'HC01FSU1'],
+    ['﻿HC01FöU1　', 'HC01FÖU1'],
+    [' SFS\t2018:218 ', 'sfs-2018-218'],
+    ['sfs  2018:218', 'sfs-2018-218'],
+  ])('keeps document ID %j canonical as %s', (input, canonical) => {
+    expect(normalizeDocumentId(input)).toBe(canonical);
+  });
+  it.each(['SFS2018:218', 'sfs 2018-218', 'sfs-2018-0218', '2018:0218', 'HC01-FöU1', 'HC01FüU1'])(
+    'rejects document ID %j',
+    (input) => {
+      expect(() => normalizeDocumentId(input)).toThrow('Invalid documentId');
+    },
+  );
+  it.each([
+    ['2024/25 :FöU1', '2024/25', 'FÖU1'],
+    [' föu1 ', '2024/25', 'FÖU1'],
+    ['1999/2000:KU1', '1999/00', 'KU1'],
+  ])('keeps report %j in %s canonical as %s', (input, session, canonical) => {
+    expect(normalizeReport(input, session)).toBe(canonical);
+  });
+  it.each(['FſU1', 'FöU01', 'Fö U1', 'FöU', 'a:b:c', '2024/25:'])('rejects report %j', (input) => {
+    expect(() => normalizeReport(input, '2024/25')).toThrow('Invalid report');
+  });
+  it('names a disagreeing report session even around whitespace', () => {
+    expect(() => normalizeReport(' 2023/24 : FöU1 ', '2024/25')).toThrow('Invalid report session');
+  });
+});
+
+describe('vote-record document IDs', () => {
+  it.each([
+    ['H6190118-1', 'H6190118-1'],
+    ['h6190118-1', 'H6190118-1'],
+    [' HA191017-1 ', 'HA191017-1'],
+    ['hc191124-12', 'HC191124-12'],
+    ['K6190118-1', 'K6190118-1'],
+  ])('canonicalizes %j to %s', (input, canonical) => {
+    expect(normalizeDocumentId(input)).toBe(canonical);
+    expect(normalizeDocumentId(canonical)).toBe(canonical);
+  });
+  it.each([
+    'H6190118-01',
+    'H6190118-0',
+    'H619118-1',
+    'H61901180-1',
+    'H6090118-1',
+    'H6190118-1-2',
+    'Hö190118-1',
+    '6H190118-1',
+    'H6190118‑1',
+    'H6190118-',
+    'H6190118 -1',
+    'ſ6190118-1',
+  ])('rejects %j', (input) => {
+    expect(() => normalizeDocumentId(input)).toThrow('Invalid documentId');
+  });
+  it('names the caller field in a rejection', () => {
+    expect(() => normalizeDocumentId('H6190118-0', 'relatedDocumentId')).toThrow(
+      'Invalid relatedDocumentId',
+    );
+  });
+  it('is documented in the identifiers topic in the spelling the normalizer returns', () => {
+    const explanation =
+      REFERENCE_TABLES.identifiers.find((row) => row.code === 'documentId')?.explanation ?? '';
+    expect(explanation).toContain(normalizeDocumentId('h6190118-1'));
+  });
+});
+
+describe('report designation normalization', () => {
+  it.each([
+    ['FöU1', '2024/25'],
+    ['2024/25:föu1', '2024/25'],
+  ])('accepts decomposed %j like the composed designation', (input, session) => {
+    expect(normalizeReport(input, session)).toBe('FÖU1');
+  });
+  it.each(['2024/25: FöU1', ' 2024/25 : FöU1 ', '2024/2025:\tFöU1'])(
+    'trims each part of %j',
+    (input) => {
+      expect(normalizeReport(input, '2024/25')).toBe('FÖU1');
+    },
+  );
+});
+
+describe('N-series SFS identifiers', () => {
+  it.each(['sfs-N2026-7', 'sfs-n2026-7', 'SFS N2026:7', 'sfs\tn2026:7', 'N2026:7', ' n2026:7 '])(
+    'canonicalizes %j to sfs-N2026-7',
+    (input) => {
+      expect(normalizeDocumentId(input)).toBe('sfs-N2026-7');
+    },
+  );
+  it.each([
+    'sfs-N2026-07',
+    'sfsN2026:7',
+    'SFS N 2026:7',
+    'N2026-7',
+    'sfs-NN2026-7',
+    'sfs-X2026-7',
+    'N0999:7',
+  ])('rejects %j', (input) => {
+    expect(() => normalizeDocumentId(input)).toThrow('Invalid documentId');
+  });
+  it('is documented in the identifiers topic with the spellings the normalizers return', () => {
+    const explanation = (code: string) =>
+      REFERENCE_TABLES.identifiers.find((row) => row.code === code)?.explanation ?? '';
+    for (const alias of ['sfs-N2026-7', 'SFS N2026:7', 'N2026:7']) {
+      expect(explanation('sfs')).toContain(alias);
+      expect(normalizeDocumentId(alias)).toBe('sfs-N2026-7');
+    }
+    expect(explanation('sfs')).toContain('resolve to sfs-N2026-7');
+    expect(explanation('documentId')).toContain(`uppercase (${normalizeDocumentId('hc01föu1')})`);
+    expect(explanation('report')).toContain('returned as published (FöU1)');
+  });
+  it('re-normalizes every canonical SFS form to itself', () => {
+    for (const id of ['sfs-N2026-7', 'sfs-2000-100'])
+      expect(normalizeDocumentId(normalizeDocumentId(id))).toBe(id);
   });
 });
