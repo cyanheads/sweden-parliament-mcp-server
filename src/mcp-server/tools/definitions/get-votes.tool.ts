@@ -51,7 +51,7 @@ const inputSchema = z.object({
     .min(1)
     .describe('Parliamentary session, e.g. 2024/25.'),
   report: optionalText('report').describe(
-    'Report designation or session:designation. Report mode: alternative to documentId. Member mode: optional local row filter.',
+    'Report designation or session:designation; a committee prefix typed without its Swedish letter resolves (fou17 is FöU17). Report mode: alternative to documentId. Member mode: optional local row filter.',
   ),
   documentId: optionalText('documentId').describe(
     'Report mode: documentId from riksdag_search_documents with documentType bet; alternative to report.',
@@ -119,6 +119,18 @@ const outputSchema = z.object({
       'Published report designation (FöU1); a found:false result echoes the normalized request.',
     ),
   documentId: z.string().optional().describe('Authoritative report document ID.'),
+  chamberStatus: z
+    .string()
+    .optional()
+    .describe(
+      'Report chamber status as published (Beslutat), the metadata.chamberStatus of riksdag_get_document; absent when unpublished.',
+    ),
+  decisionDate: z
+    .string()
+    .optional()
+    .describe(
+      'Date the chamber decided the report, at source precision; absent until decided or when unpublished.',
+    ),
   memberId: z.string().optional().describe('Normalized member ID, preserving leading zeros.'),
   party: z.string().optional().describe('Applied member-mode party filter.'),
   guidance: z.string().optional().describe('How to resolve a missing report.'),
@@ -295,12 +307,12 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
       source: 'Source: The Swedish Parliament',
       retrievedAt: '',
       notices: [
-        'Vote data covers published main votes (huvudvoteringar), not every ballot round; historical coverage can be incomplete.',
+        'Vote data covers published main votes (huvudvoteringar) from 2002/03, not every ballot round; earlier sessions return no vote rows.',
       ],
     };
     if (input.mode === 'member') {
       const memberId = normalizeMemberId(input.memberId ?? '');
-      const party = input.party ? normalizeCode(input.party, 'parties') : undefined;
+      const party = input.party ? normalizeCode(input.party, 'parties', 'party') : undefined;
       const report = input.report ? normalizeReport(input.report, session) : undefined;
       const offset = input.offset ?? 0;
       const requestedLimit = input.limit ?? 20;
@@ -417,6 +429,10 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
         'unknown_point',
         'The authoritative report does not contain the requested point.',
       );
+    if (loaded.plannedDecision)
+      enrichment.notices.push(
+        `The chamber has not decided report ${loaded.report}; its decision is listed as planned${loaded.plannedDecision.date === undefined ? '' : ` for ${loaded.plannedDecision.date}`}. The points carry the committee's proposals, not chamber decisions.`,
+      );
     const selected = requestedDecision ? [requestedDecision] : loaded.decisions;
     if (pointOffset > selected.length)
       enrichment.notices.push(
@@ -432,6 +448,8 @@ export const riksdagGetVotes = tool('riksdag_get_votes', {
         found: true,
         report: loaded.report,
         documentId: loaded.documentId,
+        ...(loaded.chamberStatus === undefined ? {} : { chamberStatus: loaded.chamberStatus }),
+        ...(loaded.decisionDate === undefined ? {} : { decisionDate: loaded.decisionDate }),
         revision: loaded.revision,
         points,
         pointTotalCount: loaded.decisions.length,

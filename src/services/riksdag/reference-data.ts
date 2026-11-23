@@ -2551,7 +2551,7 @@ export const REFERENCE_TABLES: Readonly<Record<ReferenceTopic, readonly Referenc
       code: 'report',
       labelSv: 'Betänkandebeteckning',
       explanation:
-        'Use a report designation such as KU1, optionally prefixed with session (2025/26:KU1). The prefix must agree with the session filter. Input matching is case-insensitive; designations are returned as published (FöU1), while the report document ID is normalized (HC01FÖU1).',
+        'Use a report designation such as KU1, optionally prefixed with session (2025/26:KU1). The prefix must agree with the session filter. Input matching is case-insensitive, and a committee prefix typed without its Swedish letter resolves to that committee (fou1 matches FöU1); designations are returned as published (FöU1), while the report document ID is normalized (HC01FÖU1).',
     },
     {
       code: 'memberId',
@@ -2589,13 +2589,13 @@ export const REFERENCE_TABLES: Readonly<Record<ReferenceTopic, readonly Referenc
       code: 'votes',
       labelSv: 'Huvudvoteringar',
       explanation:
-        'Main votes begin in 1993/94 with acknowledged historical gaps. Main votes can concern the substantive issue or motivation; other ballot rounds are not included. Empty vote data does not prove acclamation or unanimity; only report decision evidence establishes acclamation.',
+        'Main votes begin in 2002/03; the source returns no vote rows for earlier sessions. Main votes can concern the substantive issue or motivation; other ballot rounds are not included. Empty vote data does not prove acclamation or unanimity; only report decision evidence establishes acclamation.',
     },
     {
       code: 'members',
       labelSv: 'Ledamöter',
       explanation:
-        'Register records are strongest from around 1990. Member search defaults to register service, covering current and recent service plus ministers; register all reaches earlier records with a larger cold request that can time out. Source-reported hits and returned records can differ. Serving substitutes are included in source service classification; unknown labels stay unknown. Assignment dates do not establish historical sitting status.',
+        'Register records are strongest from around 1990. Member search defaults to register service, covering current and recent service plus ministers; register all reaches earlier records with a larger cold request that can time out unless committee or familyNamePrefix narrows it. Source-reported hits and returned records can differ. Serving substitutes are included in source service classification; unknown labels stay unknown. Assignment dates do not establish historical sitting status.',
     },
     {
       code: 'sfs',

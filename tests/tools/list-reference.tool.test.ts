@@ -98,6 +98,15 @@ describe('riksdag_list_reference', () => {
     ])
       expect(listReference.input.safeParse(args).success).toBe(false);
   });
+  it('dates main-vote coverage from the first session the vote source returns rows for', async () => {
+    const page = await listReference.handler(
+      listReference.input.parse({ topic: 'coverage' }),
+      createMockContext(),
+    );
+    const votes = page.entries.find((entry) => entry.code === 'votes')?.explanation;
+    expect(votes).toMatch(/^Main votes begin in 2002\/03;/);
+    expect(votes).not.toContain('1993/94');
+  });
   it('retains distinct document subtype values and source series leading zeros', async () => {
     const entries = [];
     let input = listReference.input.parse({ topic: 'document_types', limit: 100 });

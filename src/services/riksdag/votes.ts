@@ -4,12 +4,17 @@
  */
 import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError, validationError } from '@cyanheads/mcp-ts-core/errors';
-import { documentDecisionSchema, loadDocumentStatus, resolveReport } from './documents.js';
+import {
+  type DocumentRecord,
+  documentDecisionSchema,
+  loadDocumentStatus,
+  resolveReport,
+} from './documents.js';
 import {
   canonicalDocumentId,
   normalizeDocumentId,
-  normalizeReport,
   normalizeSession,
+  reportDesignationKey,
 } from './normalize.js';
 import type { RiksdagService } from './riksdag-service.js';
 import { revisionOf } from './text.js';
@@ -175,8 +180,9 @@ export const reportPointSchema = z
   .describe('One report point with complete party results and source evidence.');
 
 const sourceSession = (value: string) => parseSourceIdentity(value, normalizeSession);
+/** Published designations compare as written: the caller-input committee fold never applies. */
 const sourceReport = (value: string, session: string) =>
-  parseSourceIdentity(value, (report) => normalizeReport(report, session));
+  parseSourceIdentity(value, (report) => reportDesignationKey(report, session));
 
 const STANDARD_VOTE_LABELS = new Map<string, 'yes' | 'no' | 'abstain' | 'absent'>([
   ['Ja', 'yes'],
@@ -247,8 +253,9 @@ function memberRows(
       (row.beteckning === undefined ||
         sourceReport(row.beteckning, session) !== selection.report ||
         row.punkt !== selection.point ||
-        row.dok_id === undefined ||
-        parseSourceIdentity(row.dok_id, normalizeDocumentId) !== selection.documentId)
+        // Some ballot lists publish an empty dok_id; the report, point and session still identify them.
+        (row.dok_id !== undefined &&
+          parseSourceIdentity(row.dok_id, normalizeDocumentId) !== selection.documentId))
     )
       identityFailure();
     if (row.votering_url_xml) sourceUrl(row.votering_url_xml);
@@ -378,9 +385,49 @@ function selectionMismatch(message: string, hint: string): never {
   throw validationError(message, { reason: 'invalid_filter', recovery: { hint } });
 }
 
+/** The latest of the published dates, which share the source's `YYYY-MM-DD HH:MM:SS` form. */
+function latestDate(activities: DocumentRecord['activities']): string | undefined {
+  return activities.reduce<string | undefined>(
+    (latest, { date }) =>
+      date !== undefined && (latest === undefined || date > latest) ? date : latest,
+    undefined,
+  );
+}
+
+/**
+ * The chamber's decision as the report status record publishes it. `chamberStatus` is the value
+ * riksdag_get_document returns as `metadata.chamberStatus`. `decisionDate` is the latest occurred
+ * (`inträffat`) BES activity's date at source precision; `beslutdatumtid` is never read, since it
+ * holds the scheduled date before a decision. `plannedDecision` marks a report the chamber has not
+ * decided: no BES has occurred, one is planned (`planerat`) and no chamber status is published (a
+ * decided report from a session that never publishes one still has its occurred BES). It carries
+ * the latest planned date when published and is never compared with the clock, so a postponed
+ * decision whose planned date has passed stays planned.
+ */
+function chamberDecision(record: DocumentRecord): {
+  chamberStatus?: string;
+  decisionDate?: string;
+  plannedDecision?: { date?: string };
+} {
+  const decisions = record.activities.filter((activity) => activity.code === 'BES');
+  const occurred = decisions.filter((activity) => activity.status?.toLowerCase() === 'inträffat');
+  const planned = decisions.filter((activity) => activity.status?.toLowerCase() === 'planerat');
+  const { chamberStatus } = record.metadata;
+  const decisionDate = latestDate(occurred);
+  const plannedDate = latestDate(planned);
+  return {
+    ...(chamberStatus === undefined ? {} : { chamberStatus }),
+    ...(decisionDate === undefined ? {} : { decisionDate }),
+    ...(occurred.length === 0 && planned.length > 0 && chamberStatus === undefined
+      ? { plannedDecision: plannedDate === undefined ? {} : { date: plannedDate } }
+      : {}),
+  };
+}
+
 /**
  * Loads the authoritative full point catalog before any local page is selected. The returned
- * `report` is the published designation (`FöU1`) and `reportKey` its `normalizeReport` key. A
+ * `report` is the published designation (`FöU1`), `reportKey` its `reportDesignationKey`, and the
+ * chamber decision fields come from the same status record ({@link chamberDecision}). A
  * direct documentId naming a non-report, another session's report or a report disagreeing with
  * `report` throws `invalid_filter`; a status record missing type, session or designation stays
  * `upstream_identity_mismatch`.
@@ -431,7 +478,14 @@ export async function loadVoteReport(
     decisions,
   });
   budget.check();
-  return { ...loaded, report: designation, reportKey, decisions, revision };
+  return {
+    ...loaded,
+    report: designation,
+    reportKey,
+    decisions,
+    revision,
+    ...chamberDecision(loaded.record),
+  };
 }
 
 function pointRows(

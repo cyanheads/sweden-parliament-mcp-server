@@ -9,6 +9,7 @@ import { successEnrichment } from '@/services/riksdag/output.js';
 import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksdag-service.js';
 import { continuationArgs } from '../services/riksdag/continuation-fixtures.js';
 import {
+  DECIDED_STATUS,
   memberReportRows,
   memberVoteRows,
   publishedReportFetch,
@@ -16,6 +17,7 @@ import {
   reportFetch,
   timestampedMemberRow,
   timestampedMemberRows,
+  UNDECIDED_STATUS,
   voteReport,
 } from '../services/riksdag/vote-fixtures.js';
 
@@ -629,6 +631,8 @@ describe('vote public contracts', () => {
     { documentId: 'hc01föu1' },
     { report: 'föu1' },
     { report: '2024/25:FÖU1' },
+    { report: 'fou1' },
+    { report: '2024/25:FOU1' },
   ])(
     'returns the published designation and continues to the same report from %j',
     async (selection) => {
@@ -659,19 +663,160 @@ describe('vote public contracts', () => {
       ).toHaveLength(3);
     },
   );
-  it('echoes the normalized requested report when no exact report exists', async () => {
-    initRiksdagService({
-      fetch: async () => Response.json({ dokumentlista: { '@traffar': '0' } }),
-    });
-    const { domain, enrichment } = success(
-      await runToolContract(riksdagGetVotes, {
+  it.each(['föu1', 'fou1'])(
+    'echoes the normalized requested report %s when no exact report exists',
+    async (report) => {
+      initRiksdagService({
+        fetch: async () => Response.json({ dokumentlista: { '@traffar': '0' } }),
+      });
+      const { domain, enrichment } = success(
+        await runToolContract(riksdagGetVotes, {
+          mode: 'report',
+          session: '2024/25',
+          report,
+        }),
+      );
+      expect(domain).toEqual({
         mode: 'report',
         session: '2024/25',
-        report: 'föu1',
-      }),
+        found: false,
+        report: 'FÖU1',
+        guidance:
+          'Use riksdag_search_documents with documentType bet and the session to find the report document ID.',
+      });
+      expect(JSON.parse(enrichment.effectiveQuery)).toMatchObject({ report: 'FÖU1' });
+    },
+  );
+  it.each([false, true])(
+    'requests an ASCII-typed committee report by its Swedish designation on every route (ballots %s)',
+    async (ballots) => {
+      const network = vi.fn<typeof fetch>().mockImplementation(publishedReportFetch());
+      initRiksdagService({ fetch: network });
+      const { domain, enrichment } = success(
+        await runToolContract(riksdagGetVotes, {
+          mode: 'report',
+          session: '2024/25',
+          report: 'fou1',
+          point: 2,
+          ...(ballots ? { ballots } : {}),
+        }),
+      );
+      expect(domain).toMatchObject({
+        found: true,
+        report: 'FöU1',
+        documentId: 'HC01FÖU1',
+        points: [{ decision: { point: 2 }, rollCallState: 'available' }],
+      });
+      expect(JSON.parse(enrichment.effectiveQuery)).toMatchObject({ report: 'FÖU1' });
+      const urls = network.mock.calls.map(([request]) => new URL(String(request)));
+      expect(urls.map(({ pathname }) => decodeURIComponent(pathname))).toEqual([
+        '/dokumentlista/',
+        '/dokumentstatus/HC01FÖU1.json',
+        '/voteringlista/',
+      ]);
+      expect([urls[0]?.searchParams.get('bet'), urls[2]?.searchParams.get('bet')]).toEqual([
+        'FÖU1',
+        'FÖU1',
+      ]);
+    },
+  );
+  const undecidedNotice =
+    "The chamber has not decided report KU1; its decision is listed as planned for 2026-11-25 00:00:00. The points carry the committee's proposals, not chamber decisions.";
+  it('carries the chamber status and decision date of a decided report on both surfaces', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(reportFetch(undefined, 4, DECIDED_STATUS));
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagGetVotes, {
+      mode: 'report',
+      session: '2024/25',
+      documentId: 'HC01KU1',
+    });
+    const { domain, enrichment } = success(result);
+    expect(result.structuredContent).toMatchObject({
+      found: true,
+      chamberStatus: 'Beslutat',
+      decisionDate: '2026-06-03 00:00:00',
+      returnedCount: 4,
+    });
+    expect(domain.points!.map((point) => point.rollCallState)).toEqual([
+      'acclamation',
+      'not_published',
+      'unknown',
+      'not_published',
+    ]);
+    expect(enrichment.notices.join(' ')).not.toContain('has not decided');
+    expect(network).toHaveBeenCalledTimes(5);
+  });
+  it('flags an undecided report with one appended notice and leaves every point unknown', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(reportFetch(undefined, 4, UNDECIDED_STATUS));
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagGetVotes, {
+      mode: 'report',
+      session: '2024/25',
+      documentId: 'HC01KU1',
+      pointLimit: 11,
+    });
+    const { domain, enrichment } = success(result);
+    expect(result.structuredContent).not.toHaveProperty('chamberStatus');
+    expect(result.structuredContent).not.toHaveProperty('decisionDate');
+    expect(domain.points!.map((point) => point.rollCallState)).toEqual([
+      'unknown',
+      'unknown',
+      'unknown',
+      'unknown',
+    ]);
+    expect(enrichment.notices).toEqual([
+      'Vote data covers published main votes (huvudvoteringar) from 2002/03, not every ballot round; earlier sessions return no vote rows.',
+      'Requested pointLimit was clamped to 10.',
+      undecidedNotice,
+    ]);
+    expect(network).toHaveBeenCalledTimes(5);
+  });
+  it('flags a planned decision dated in the past the same way whatever the current date', async () => {
+    const status = {
+      ...UNDECIDED_STATUS,
+      aktivitet: [{ kod: 'BES', namn: 'Beslut', datum: '2020-03-04 00:00:00', status: 'planerat' }],
+    };
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const runs: string[][] = [];
+    for (const now of ['2019-06-01T00:00:00Z', '2026-11-23T00:00:00Z']) {
+      vi.setSystemTime(new Date(now));
+      initRiksdagService({ fetch: reportFetch(undefined, 1, status) });
+      const result = await runToolContract(riksdagGetVotes, {
+        mode: 'report',
+        session: '2024/25',
+        documentId: 'HC01KU1',
+      });
+      const { enrichment } = success(result);
+      expect(result.structuredContent).not.toHaveProperty('decisionDate');
+      runs.push(enrichment.notices);
+    }
+    expect(runs[0]).toContain(
+      "The chamber has not decided report KU1; its decision is listed as planned for 2020-03-04 00:00:00. The points carry the committee's proposals, not chamber decisions.",
     );
-    expect(domain).toMatchObject({ found: false, report: 'FÖU1' });
-    expect(JSON.parse(enrichment.effectiveQuery)).toMatchObject({ report: 'FÖU1' });
+    expect(runs[1]).toEqual(runs[0]);
+  });
+  it('names the latest of several planned decision dates in the notice', async () => {
+    const planned = (datum: string) => ({ kod: 'BES', namn: 'Beslut', datum, status: 'planerat' });
+    initRiksdagService({
+      fetch: reportFetch(undefined, 1, {
+        ...UNDECIDED_STATUS,
+        aktivitet: ['2026-06-10 00:00:00', '2026-06-17 00:00:00', '2026-06-03 00:00:00'].map(
+          planned,
+        ),
+      }),
+    });
+    const result = await runToolContract(riksdagGetVotes, {
+      mode: 'report',
+      session: '2024/25',
+      documentId: 'HC01KU1',
+    });
+    expect(success(result).enrichment.notices).toContain(
+      "The chamber has not decided report KU1; its decision is listed as planned for 2026-06-17 00:00:00. The points carry the committee's proposals, not chamber decisions.",
+    );
   });
   it('distinguishes missing report, unknown point and empty report point catalog', async () => {
     initRiksdagService({
@@ -921,7 +1066,17 @@ describe('vote public contracts', () => {
         Response.json({ voteringlista: { '@antal': String(rows.length), votering: rows } }),
       );
   }
-  it.each(['FöU1', 'föu1', 'FÖU1', '2024/25:FöU1', '2024/25: FöU1', 'FöU1'])(
+  it.each([
+    'FöU1',
+    'föu1',
+    'FÖU1',
+    '2024/25:FöU1',
+    '2024/25: FöU1',
+    'FöU1',
+    'fou1',
+    'FOU1',
+    '2024/25:fou1',
+  ])(
     'narrows member rows to report %s locally with one cold request and none warm',
     async (report) => {
       const network = memberReportNetwork();
@@ -1031,11 +1186,22 @@ describe('vote public contracts', () => {
     expect(JSON.parse(enrichment.effectiveQuery)).toMatchObject({ report: 'FÖU1', point: 3 });
   });
   it.each([
-    { report: 'KU9', notice: 'matched report KU9 in this session' },
-    { report: 'FöU1', point: 2, notice: 'matched report FÖU1 point 2 in this session' },
+    { report: 'KU9', key: 'KU9', notice: 'matched report KU9 in this session' },
+    {
+      report: 'FöU1',
+      point: 2,
+      key: 'FÖU1',
+      notice: 'matched report FÖU1 point 2 in this session',
+    },
+    {
+      report: 'fou1',
+      point: 2,
+      key: 'FÖU1',
+      notice: 'matched report FÖU1 point 2 in this session',
+    },
   ])(
     'keeps an empty member report selection successful with a report-specific notice ($report)',
-    async ({ notice, ...filter }) => {
+    async ({ notice, key, ...filter }) => {
       initRiksdagService({ fetch: memberReportNetwork() });
       const { domain, enrichment } = success(
         await runToolContract(riksdagGetVotes, { ...memberReport, ...filter }),
@@ -1053,6 +1219,7 @@ describe('vote public contracts', () => {
       expect(notices).toContain('does not establish absence or an acclamation decision');
       expect(notices).toContain('report mode');
       expect(notices).not.toContain('Check memberId');
+      expect(JSON.parse(enrichment.effectiveQuery)).toMatchObject({ report: key });
     },
   );
   it('explains an offset beyond the report-filtered rows while member candidates remain', async () => {

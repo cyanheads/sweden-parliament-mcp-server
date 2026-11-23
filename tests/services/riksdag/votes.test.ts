@@ -4,7 +4,15 @@ import { describe, expect, it, vi } from 'vitest';
 import { RiksdagService } from '@/services/riksdag/riksdag-service.js';
 import { createToolBudget } from '@/services/riksdag/transport.js';
 import { hydrateVotePoint, loadMemberVotes, loadVoteReport } from '@/services/riksdag/votes.js';
-import { memberVoteRows, reportFetch, voteReport } from './vote-fixtures.js';
+import {
+  DECIDED_STATUS,
+  memberVoteRows,
+  type ReportStatus,
+  reportFetch,
+  timestampedMemberRow,
+  UNDECIDED_STATUS,
+  voteReport,
+} from './vote-fixtures.js';
 
 describe('main vote endpoints', () => {
   it('classifies malformed source session syntax as an upstream schema failure rather than caller input', async () => {
@@ -367,6 +375,191 @@ describe('main vote endpoints', () => {
         documentId: 'HC01KU1',
         decisions: [{ point: 1 }, { point: 2 }, { point: 3 }, { point: 4 }],
       });
+    } finally {
+      service.dispose();
+    }
+  });
+});
+
+describe('published report designations', () => {
+  it('keeps a decision whose designation is published without its Swedish letter an identity mismatch', async () => {
+    const payload = {
+      dokumentstatus: {
+        dokument: { dok_id: 'HC01FöU1', doktyp: 'bet', rm: '2024/25', beteckning: 'FöU1' },
+        dokutskottsforslag: { utskottsforslag: { punkt: '1', rm: '2024/25', bet: 'FOU1' } },
+      },
+    };
+    const service = new RiksdagService({ fetch: async () => Response.json(payload) });
+    using budget = createToolBudget();
+    try {
+      await expect(
+        loadVoteReport(service, '2024/25', undefined, 'HC01FÖU1', budget),
+      ).rejects.toMatchObject({ data: { reason: 'upstream_identity_mismatch' } });
+    } finally {
+      service.dispose();
+    }
+  });
+  it('keeps a point ballot whose designation is published without its Swedish letter an identity mismatch', async () => {
+    const ballot = {
+      votering_id: 'V-FOU17-1',
+      intressent_id: '0001',
+      rm: '2025/26',
+      beteckning: 'FOU17',
+      punkt: '1',
+      parti: 'S',
+      rost: 'Ja',
+      avser: 'sakfrågan',
+      dok_id: 'HC01FöU17',
+    };
+    const service = new RiksdagService({
+      fetch: async () => Response.json({ voteringlista: { '@antal': '1', votering: ballot } }),
+    });
+    using budget = createToolBudget();
+    try {
+      await expect(
+        hydrateVotePoint(service, '2025/26', 'FÖU17', 'HC01FÖU17', { point: 1 }, budget),
+      ).rejects.toMatchObject({ data: { reason: 'upstream_identity_mismatch' } });
+    } finally {
+      service.dispose();
+    }
+  });
+  it('matches member rows to the report key by their published designation, unfolded', async () => {
+    const rows = [
+      timestampedMemberRow('V-FOU1-1', 'FöU1', '1', 'sakfrågan', '2025-01-02 09:00:00'),
+      timestampedMemberRow('V-ASCII-2', 'FOU1', '2', 'sakfrågan', '2025-01-02 09:00:00'),
+    ];
+    const service = new RiksdagService({
+      fetch: async () =>
+        Response.json({ voteringlista: { '@antal': String(rows.length), votering: rows } }),
+    });
+    using budget = createToolBudget();
+    try {
+      for (const [report, voteIds] of [
+        ['FÖU1', ['V-FOU1-1']],
+        ['FOU1', ['V-ASCII-2']],
+      ] as const) {
+        const result = await loadMemberVotes(service, '2024/25', '0001', undefined, budget, {
+          report,
+          point: undefined,
+        });
+        expect(result.rows.map((row) => row.voteId)).toEqual(voteIds);
+      }
+    } finally {
+      service.dispose();
+    }
+  });
+});
+
+describe('chamber decision from the report status record', () => {
+  const bes = (status: string, datum?: string) => ({
+    kod: 'BES',
+    namn: 'Beslut',
+    status,
+    ...(datum === undefined ? {} : { datum }),
+  });
+  const beslutat = { kod: 'arendestatuskammaren', namn: 'Beslutat', text: '' };
+  it.each<[string, ReportStatus, Record<string, unknown>]>([
+    [
+      'a decided report',
+      DECIDED_STATUS,
+      { chamberStatus: 'Beslutat', decisionDate: '2026-06-03 00:00:00' },
+    ],
+    [
+      'an undecided report with a scheduled decision date',
+      UNDECIDED_STATUS,
+      { plannedDecision: { date: '2026-11-25 00:00:00' } },
+    ],
+    [
+      'a planned decision dated in the past',
+      { aktivitet: [bes('planerat', '2020-03-04 00:00:00')] },
+      { plannedDecision: { date: '2020-03-04 00:00:00' } },
+    ],
+    [
+      'an occurred decision without a published chamber status',
+      { aktivitet: [bes('inträffat', '2010-12-15 00:00:00')] },
+      { decisionDate: '2010-12-15 00:00:00' },
+    ],
+    ['a record with no activities or properties', {}, {}],
+    [
+      'several occurred decisions',
+      {
+        aktivitet: [
+          bes('inträffat', '2026-06-03 00:00:00'),
+          bes('inträffat', '2026-06-10 00:00:00'),
+          bes('inträffat', '2026-06-05 00:00:00'),
+        ],
+      },
+      { decisionDate: '2026-06-10 00:00:00' },
+    ],
+    [
+      'a planned decision beside a published chamber status',
+      { uppgift: [beslutat], aktivitet: [bes('planerat', '2026-06-03 00:00:00')] },
+      { chamberStatus: 'Beslutat' },
+    ],
+    [
+      'an occurred and a planned decision',
+      {
+        aktivitet: [
+          bes('planerat', '2026-06-10 00:00:00'),
+          bes('inträffat', '2026-06-03 00:00:00'),
+        ],
+      },
+      { decisionDate: '2026-06-03 00:00:00' },
+    ],
+    [
+      'a planned decision without a date',
+      { aktivitet: [bes('planerat')] },
+      { plannedDecision: {} },
+    ],
+    [
+      'an occurred decision without a date',
+      { uppgift: [beslutat], aktivitet: [bes('inträffat')] },
+      { chamberStatus: 'Beslutat' },
+    ],
+    [
+      'an occurred decision with a capitalized status',
+      { aktivitet: [bes('Inträffat', '2026-06-03 00:00:00')] },
+      { decisionDate: '2026-06-03 00:00:00' },
+    ],
+    [
+      'a planned decision with a capitalized status',
+      { aktivitet: [bes('Planerat', '2026-06-03 00:00:00')] },
+      { plannedDecision: { date: '2026-06-03 00:00:00' } },
+    ],
+    [
+      'a decision whose beslutdatumtid differs from its occurred decision',
+      {
+        uppgift: [
+          beslutat,
+          {
+            kod: 'beslutdatumtid',
+            namn: 'Datum och tid för beslutet',
+            text: '2026-06-01 00:00:00',
+          },
+        ],
+        aktivitet: [bes('inträffat', '2026-06-03 00:00:00')],
+      },
+      { chamberStatus: 'Beslutat', decisionDate: '2026-06-03 00:00:00' },
+    ],
+    [
+      'planned committee steps without a decision activity',
+      {
+        aktivitet: [
+          { kod: 'UBE', namn: 'Beredning', datum: '2026-12-08 00:00:00', status: 'planerat' },
+        ],
+      },
+      {},
+    ],
+  ])('reads %s', async (_name, status, expected) => {
+    const network = vi.fn<typeof fetch>().mockImplementation(reportFetch(undefined, 2, status));
+    const service = new RiksdagService({ fetch: network });
+    using budget = createToolBudget();
+    try {
+      const result = await loadVoteReport(service, '2024/25', undefined, 'HC01KU1', budget);
+      if (!result.found) throw new Error('Expected the report.');
+      const { chamberStatus, decisionDate, plannedDecision } = result;
+      expect({ chamberStatus, decisionDate, plannedDecision }).toEqual(expected);
+      expect(network).toHaveBeenCalledTimes(1);
     } finally {
       service.dispose();
     }

@@ -79,6 +79,31 @@ describe('vote mode contracts', () => {
       }
     },
   );
+  it('names the party field when a member-mode party code is unknown', async () => {
+    const network = vi.fn<typeof fetch>();
+    initRiksdagService({ fetch: network });
+    try {
+      const result = await runToolContract(riksdagGetVotes, {
+        mode: 'member',
+        session: '2024/25',
+        memberId: '0001',
+        party: 'xyz',
+      });
+      expect(result).toMatchObject({
+        isError: true,
+        structuredContent: {
+          error: {
+            message: 'Invalid party; use riksdag_list_reference to check its format or code.',
+            data: { reason: 'invalid_filter', field: 'party' },
+          },
+        },
+      });
+      expect(JSON.stringify(result.content)).toContain('Invalid party;');
+      expect(network).not.toHaveBeenCalled();
+    } finally {
+      getRiksdagService().dispose();
+    }
+  });
   it('keeps session arithmetic a handler invalid_filter behind a matching pattern', async () => {
     const network = vi.fn<typeof fetch>();
     initRiksdagService({ fetch: network });

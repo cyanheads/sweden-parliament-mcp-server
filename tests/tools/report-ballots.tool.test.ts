@@ -6,9 +6,11 @@ import { riksdagGetVotes } from '@/mcp-server/tools/definitions/get-votes.tool.j
 import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksdag-service.js';
 import { continuationArgs } from '../services/riksdag/continuation-fixtures.js';
 import {
+  DECIDED_STATUS,
   publishedReportFetch,
   publishedSizeRows,
   reportFetch,
+  UNDECIDED_STATUS,
 } from '../services/riksdag/vote-fixtures.js';
 
 afterEach(() => {
@@ -183,6 +185,43 @@ describe('report ballots', () => {
       expect(String(network.mock.calls[1]![0])).not.toContain('gruppering');
     },
   );
+  it('carries the chamber status and decision date on a decided report’s ballot page', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(
+        reportFetch(
+          () => ({ voteringlista: { '@antal': '3', votering: rows() } }),
+          4,
+          DECIDED_STATUS,
+        ),
+      );
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagGetVotes, args);
+    const domain = success(result);
+    expect(domain).toMatchObject({
+      chamberStatus: 'Beslutat',
+      decisionDate: '2026-06-03 00:00:00',
+      ballotPage: { totalCount: 3, returnedCount: 1 },
+    });
+    expect(JSON.stringify(result.structuredContent)).not.toContain('has not decided');
+    expect(network).toHaveBeenCalledTimes(2);
+  });
+  it('flags an undecided report on its ballot page on both surfaces', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(reportFetch(undefined, 4, UNDECIDED_STATUS));
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagGetVotes, { ...args, offset: 0 });
+    const domain = success(result);
+    expect(domain).not.toHaveProperty('chamberStatus');
+    expect(domain).not.toHaveProperty('decisionDate');
+    expect(domain.points).toMatchObject([{ rollCallState: 'unknown' }]);
+    const notice =
+      "The chamber has not decided report KU1; its decision is listed as planned for 2026-11-25 00:00:00. The points carry the committee's proposals, not chamber decisions.";
+    expect(result.structuredContent).toMatchObject({ notices: expect.arrayContaining([notice]) });
+    expect(JSON.stringify(result.content)).toContain(JSON.stringify(notice).slice(1, -1));
+    expect(network).toHaveBeenCalledTimes(2);
+  });
   it('keeps empty publication and past-end ballot pages terminal while retaining authoritative acclamation', async () => {
     initRiksdagService({ fetch: reportFetch() });
     const empty = success(

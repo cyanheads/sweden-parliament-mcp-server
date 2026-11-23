@@ -1,7 +1,43 @@
 /** @fileoverview Synthetic vote records and report decisions. @module tests/services/riksdag/vote-fixtures */
 
+/** The decision-status parts of a report status record: properties, activities, point methods. */
+export interface ReportStatus {
+  aktivitet?: { kod: string; namn: string; datum?: string; status: string }[];
+  /** Replaces every point's beslutstyp, as an undecided report publishes it empty. */
+  beslutstyp?: string;
+  uppgift?: { kod: string; namn: string; text: string }[];
+}
+
+/** 2025/26:FöU17 after its decision: chamber status Beslutat and an occurred BES. */
+export const DECIDED_STATUS: ReportStatus = {
+  uppgift: [
+    { kod: 'arendestatuskammaren', namn: 'Beslutat', text: '' },
+    { kod: 'beslutdatumtid', namn: 'Datum och tid för beslutet', text: '2026-06-03 00:00:00' },
+    { kod: 'statustext', namn: 'statustext', text: 'Ärendet är avslutat' },
+  ],
+  aktivitet: [
+    { kod: 'JUS', namn: 'Justering', datum: '2026-05-26 00:00:00', status: 'inträffat' },
+    { kod: 'BEH', namn: 'Behandling', datum: '2026-06-01 00:00:00', status: 'inträffat' },
+    { kod: 'BES', namn: 'Beslut', datum: '2026-06-03 00:00:00', status: 'inträffat' },
+  ],
+};
+
+/** 2026/27:JuU9 before its decision: a scheduled beslutdatumtid, a planned BES, empty methods. */
+export const UNDECIDED_STATUS: ReportStatus = {
+  uppgift: [
+    { kod: 'beslutdatumtid', namn: 'Datum och tid för beslutet', text: '2026-11-25 00:00:00' },
+    { kod: 'statustext', namn: 'statustext', text: 'Ärendet är klart för debatt' },
+  ],
+  aktivitet: [
+    { kod: 'TRY', namn: 'Trycklov', datum: '2026-11-20 00:00:00', status: 'inträffat' },
+    { kod: 'BEH', namn: 'Behandling', datum: '2026-11-25 00:00:00', status: 'planerat' },
+    { kod: 'BES', namn: 'Beslut', datum: '2026-11-25 00:00:00', status: 'planerat' },
+  ],
+  beslutstyp: '',
+};
+
 /** Source-ordered synthetic decisions include explicit and unknown voting methods. */
-export function voteReport(count = 4) {
+export function voteReport(count = 4, status: ReportStatus = {}) {
   return {
     dokumentstatus: {
       dokument: { dok_id: 'HC01KU1', doktyp: 'bet', rm: '2024/25', beteckning: 'KU1' },
@@ -10,15 +46,19 @@ export function voteReport(count = 4) {
           punkt: String(i + 1),
           rubrik: `Syntetisk punkt ${i + 1}`,
           forslag: `Förslag ${i + 1}`,
-          ...(i === 0
-            ? { beslutstyp: 'acklamation' }
-            : i === 1 || i === 3
-              ? { beslutstyp: 'röstning' }
-              : {}),
+          ...(status.beslutstyp !== undefined
+            ? { beslutstyp: status.beslutstyp }
+            : i === 0
+              ? { beslutstyp: 'acklamation' }
+              : i === 1 || i === 3
+                ? { beslutstyp: 'röstning' }
+                : {}),
           rm: '2024/25',
           bet: 'KU1',
         })),
       },
+      ...(status.uppgift ? { dokuppgift: { uppgift: status.uppgift } } : {}),
+      ...(status.aktivitet ? { dokaktivitet: { aktivitet: status.aktivitet } } : {}),
     },
   };
 }
@@ -199,10 +239,12 @@ export function publishedSizeRows(count: number, shape: 'ballots' | 'member') {
 export function reportFetch(
   groups: (point: number) => unknown = () => ({ voteringlista: { '@antal': '0' } }),
   count = 4,
+  status: ReportStatus = {},
 ): typeof fetch {
   return async (request) => {
     const url = new URL(String(request));
-    if (url.pathname === '/dokumentstatus/HC01KU1.json') return Response.json(voteReport(count));
+    if (url.pathname === '/dokumentstatus/HC01KU1.json')
+      return Response.json(voteReport(count, status));
     if (url.pathname === '/dokumentlista/')
       return Response.json({
         dokumentlista: {

@@ -164,4 +164,52 @@ describe('complete ballot records', () => {
       }
     },
   );
+  it.each([
+    ['empty', ''],
+    ['absent', undefined],
+  ])(
+    'counts ballots that publish an %s dok_id when report, point and session match',
+    async (_, dokId) => {
+      const rows = [
+        { ...ballot('sakfrågan'), dok_id: dokId },
+        { ...ballot('sakfrågan', 'Nej'), intressent_id: '0002', dok_id: dokId },
+      ];
+      const service = new RiksdagService({
+        fetch: async () => Response.json({ voteringlista: { '@antal': '2', votering: rows } }),
+      });
+      using budget = createToolBudget();
+      try {
+        const result = await hydrateVotePoint(
+          service,
+          '2024/25',
+          'KU1',
+          'HC01KU1',
+          { point: 1 },
+          budget,
+        );
+        expect(result).toMatchObject({
+          rollCallState: 'available',
+          parties: [{ party: 'S', avser: 'sakfrågan', yes: 1, no: 1, abstain: 0, absent: 0 }],
+        });
+      } finally {
+        service.dispose();
+      }
+    },
+  );
+  it('keeps a ballot linked to another document an upstream identity mismatch', async () => {
+    const service = new RiksdagService({
+      fetch: async () =>
+        Response.json({
+          voteringlista: { '@antal': '1', votering: { ...ballot('sakfrågan'), dok_id: 'HC01KU2' } },
+        }),
+    });
+    using budget = createToolBudget();
+    try {
+      await expect(
+        hydrateVotePoint(service, '2024/25', 'KU1', 'HC01KU1', { point: 1 }, budget),
+      ).rejects.toMatchObject({ data: { reason: 'upstream_identity_mismatch' } });
+    } finally {
+      service.dispose();
+    }
+  });
 });
