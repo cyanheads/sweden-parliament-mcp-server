@@ -42,7 +42,7 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 | `riksdag_get_document` | Read publication metadata, decisions, reservations, activities, links, and paginated text |
 | `riksdag_search_speeches` | Find speeches within a session by debate heading, member, party, or related document; retrieve full text through get mode |
 | `riksdag_get_votes` | Read report decisions, party main-vote totals, individual ballots for a point, or one member's session main votes, optionally narrowed to a report or point |
-| `riksdag_search_members` | Find register entries by name, party, constituency, and source service classification |
+| `riksdag_search_members` | Find register entries by name, family-name prefix, party, committee, constituency, and source service classification; a committee returns its current holders |
 | `riksdag_get_member` | Read an exact member IID and its published assignment history |
 
 ## Capability reference
@@ -58,9 +58,10 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 
 ### `riksdag_search_documents` <sub>tool</sub>
 
-- Optional `query`, `documentType`, `session`, `committee`, `party`, `memberId`, `dateFrom`, and `dateTo`; dates use `YYYY-MM-DD`, and codes or exact reference labels are accepted. `memberId` selects source-linked participants, without inferring authorship
+- Optional `query`, `documentType`, `session`, `committee`, `party`, `memberId`, `dateFrom`, and `dateTo`; dates use `YYYY-MM-DD`, and codes or exact reference labels are accepted, and a committee code typed without its Swedish letter resolves (`fou` is `FöU`). `memberId` selects source-linked participants, without inferring authorship
 - `sort` is `relevance` for a nonblank query and `date` otherwise; either can be selected explicitly. Source subtitles include available author and SFS consolidation labels
-- Remote `page` starts at 1; `pageSize` defaults to 10 and is clamped to 50. A call returns the whole fetched remote page and `nextCall` advances `page`; the `offset` and `revision` inputs still resolve within a page, and a changed page fails with `revision_changed`
+- Remote `page` starts at 1; `pageSize` defaults to 10 and is clamped to 200. A call returns the whole fetched remote page and `nextCall` advances `page`; each record appears once: member-profile, web-page and empty-ID calendar rows (such as cancelled entries) the source mixes into results are skipped, calendar rows for single event occurrences are listed under their event's record ID, and calendar rows repeating a record are merged into it, each with a notice that counts them, and `offset` indexes the records returned; the `offset` and `revision` inputs still resolve within a page, and a changed page fails with `revision_changed`
+- The source serves the first 10,000 rows of a search. The page that reaches row 10,000 ends the continuation with a notice to narrow by `session`, `documentType`, or dates when more rows match, and a page starting after row 10,000 returns empty without a request, with a notice that page 1 shows how many rows match
 - Use `documentType: "sfs"` for consolidated statutes (N-series numbers included) and `documentType: "votering"` for vote records; narrow slow full-text searches with `session` or `documentType`
 
 ---
@@ -77,7 +78,8 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 
 ### `riksdag_search_speeches` <sub>tool</sub>
 
-- `mode: "search"` (default) requires `session`; optional `memberId`, `party`, `speechType: "all" | "speech"` (`speech` excludes replies), `headingContains`, which matches all tokens in headings and subheadings, never body text, and `relatedDocumentId`, a report or interpellation document ID that keeps the speeches the source links to it (any element of a joint debate's list). Riksdagen links a speech to its debate's document only on the segment where the debate starts, so a debate interrupted and resumed later can return just its first segment; check `headingContains` with the report title for the rest. `limit` defaults to 5 (max 20); `textCount` defaults to 1 (max 5, `0` for metadata only), and each hydrated speech returns a full default text page
+- `mode: "search"` (default) requires `session`; optional `memberId`, `party`, `speechType: "all" | "speech"` (`speech` excludes replies), `headingContains`, which matches all tokens in headings and subheadings, never body text, and `relatedDocumentId`, a report or interpellation document ID that keeps the speeches the source links to it (any element of a joint debate's list). Riksdagen links a speech to its debate's document only on the segment where the debate starts, so a debate interrupted and resumed later can return just its first segment; check `headingContains` with the report title for the rest. `limit` defaults to 5 (max 100); `textCount` defaults to 1 (max 5, `0` for metadata only), and each hydrated speech returns a full default text page
+- The source publishes some speeches twice under one `speechId`, identical apart from its UUID; search lists each once, keeps the lowest `sourceSpeechId`, and says so in a notice, while copies that differ in any field fail the call. Hydrated items keep their list-row metadata, and get mode reads a speech the source serves as two concatenated XML records as one record
 - `mode: "get"` reads one `speechId` copied from a search item (not `sourceSpeechId`) and pages the body with `textOffset` / `textLength` and `nextTextCall`. Default text pages are 8,000 code points; explicit lengths are honored
 - `textState` is `included`, `not_requested`, `unavailable`, or `failed`, with recovery details on transient failures; retain `revision` on continuations
 - A missing detail, including an exact zero-byte HTTP 200 source response, returns `found: false` in get mode or `textState: "unavailable"` during search hydration
@@ -87,6 +89,7 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 ### `riksdag_get_votes` <sub>tool</sub>
 
 - Required `mode` and `session`. `mode: "report"` takes `report` (`FiU20` or `2024/25:FiU20`) or a report `documentId`, plus one `point` or `pointOffset` / `pointLimit` (default 5, max 10); a `documentId` that names a non-report, another session's report, or a report other than `report` fails with `invalid_filter`. `mode: "member"` takes `memberId`, optional `party`, `report`, and `point` (only with `report`), and `offset` / `limit` (default 20, max 500). Report and point narrow the member's rows locally with no extra upstream request, and a match-free filter succeeds with a notice
+- Report mode also returns `chamberStatus` (the published `Beslutat`) and `decisionDate` when the source publishes them. For a report the chamber has not decided, a notice says its decision is planned (with the date when published) and that the points carry the committee's proposals. A committee prefix typed without its Swedish letter resolves in `report` (`fou17` is `FöU17`)
 - Member rows come in source-record timestamp order (`systemDate` ascending, then report, point, avser, `voteId`), not vote-date order; the source publishes no vote date in bulk, so rows carry none. Reports return as published (`FöU1`) and document IDs uppercase; matching ignores case
 - Report points carry the authoritative decision and party aggregates separated by source `avser`; `rollCallState` is `available`, `acclamation`, `not_published`, or `unknown`, and acclamation requires explicit decision evidence, never just empty vote rows. Incomplete groups retain unknown counts and observed labels; extra vote labels land in `otherVotes`
 - With an explicit report `point`, `ballots: true` adds individual `votes` and independent `ballotPage` pagination using `offset` / `limit`. Follow `ballotPage.nextCall` with both `revision` and `ballotRevision`; report-point counts keep their existing meaning
@@ -96,8 +99,9 @@ Source: The Swedish Parliament. This independent service is not operated or endo
 
 ### `riksdag_search_members` <sub>tool</sub>
 
-- `register: "service"` (default) searches current members plus recent former members, substitutes, and ministers; `register: "all"` includes earlier records. A cold all-register request is substantially larger and can reach the normal timeout
-- Optional `nameContains` matches all tokens as substrings, ignoring case and diacritics. `party` and `constituency` accept codes or exact labels. `sitting: "all" | "serving" | "not_serving"` (default `all`) filters source service labels, including serving substitutes, without establishing elected membership
+- `register: "service"` (default) searches current members plus recent former members, substitutes, and ministers; `register: "all"` includes earlier records. A cold all-register request without `committee` or `familyNamePrefix` is substantially larger and can reach the normal timeout
+- Optional `nameContains` matches all tokens as substrings, ignoring case and diacritics. `familyNamePrefix` is matched by the source in either register against the start of the sort name (`Family,Given`, so von Sydow sorts as Sydow), ignoring case but not accents (`Åkesson`, not `akesson`), with V and W treated alike; it cannot contain `%`, `_` or a comma. `party`, `committee`, and `constituency` accept codes or exact labels. `sitting: "all" | "serving" | "not_serving"` (default `all`) filters source service labels, including serving substitutes, without establishing elected membership
+- `committee` lists that committee's current holders in either register, each with `committeeAssignments`: the assignments in that committee whose interval contains the source time, in source order, with a date-only end counting through that day. Source-reported hits count assignments, so they can exceed the returned member records; a notice discloses the difference and any member whose assignment is not current. The roster covers current holders only; use `riksdag_get_member` for assignment history
 - `offset` pagination; `limit` defaults to 20, clamped to 100. Returns actual `candidateCount`, filtered `totalCount`, `sourceReportedCount`, `revision`, and `nextCall`. Source-reported hits can differ from returned all-register records; a notice discloses this, and neither count is an independent historical census
 - `memberId` keeps leading zeros. Entries without an IID return `detailAvailable: false`; their `sourceRecordId` is a different identifier and can't be passed to `riksdag_get_member`
 
@@ -117,8 +121,8 @@ Riksdag-specific:
 
 - Keyless access to official document, speech, vote, and member endpoints, plus dated official reference tables
 - Document text as canonical Markdown or SFS source text, with separately selectable original HTML
-- Shared upstream concurrency, bounded public-response caching, and one 55-second deadline across queueing, retries, and text hydration
-- Historical coverage varies by record type; speeches and votes start in 1993/94, with gaps in older vote data
+- Shared upstream concurrency, bounded public-response caching (Markdown conversions are memoized beside the cached status response they derive from), and one 55-second deadline across queueing, retries, and text hydration
+- Historical coverage varies by record type; speeches start in 1993/94 and main votes in 2002/03; the source returns no vote rows for earlier sessions
 
 Agent-friendly output:
 
