@@ -277,6 +277,90 @@ describe('fixed-origin transport', () => {
   });
 });
 
+describe('endpoint opt-in for a non-JSON body', () => {
+  const rows = z.object({ rows: z.array(z.object({ id: z.string() })).min(1) });
+  const plain = {
+    path: '/dokumentlista/',
+    schema: rows,
+    ttlMs: 120000,
+  } satisfies JsonLoadSpec<typeof rows>;
+  const decodeRows = vi.fn((text: string) =>
+    text.startsWith('<rows>') ? { rows: [{ id: text.slice(6, -7) }] } : undefined,
+  );
+  const request = { ...plain, decodeNonJson: decodeRows, cacheable: () => true };
+  afterEach(() => decodeRows.mockClear());
+
+  it('parses the decoded value with the endpoint schema and returns its JSON serialization', async () => {
+    const transport = new RiksdagTransport(async () => new Response('<rows>a</rows>'));
+    using budget = createToolBudget();
+    await expect(transport.load(transport.url(spec.path), request, budget)).resolves.toMatchObject({
+      found: true,
+      data: { rows: [{ id: 'a' }] },
+      wireJson: '{"rows":[{"id":"a"}]}',
+    });
+    transport.dispose();
+  });
+  it('caches the decoded value and serves it again without a request', async () => {
+    vi.useFakeTimers();
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => new Response('<rows>b</rows>'));
+    const service = new RiksdagService({ fetch: network });
+    let first: unknown;
+    {
+      using budget = createToolBudget();
+      first = await service.loadJson(request, budget);
+    }
+    expect(first).toMatchObject({ found: true, data: { rows: [{ id: 'b' }] } });
+    vi.advanceTimersByTime(119999);
+    {
+      using budget = createToolBudget();
+      await expect(service.loadJson(request, budget)).resolves.toEqual(first);
+    }
+    expect(network).toHaveBeenCalledTimes(1);
+    expect(decodeRows).toHaveBeenCalledTimes(1);
+    service.dispose();
+  });
+  it('never passes a JSON body to the decoder', async () => {
+    const transport = new RiksdagTransport(async () => Response.json({ rows: [{ id: 'json' }] }));
+    using budget = createToolBudget();
+    await expect(transport.load(transport.url(spec.path), request, budget)).resolves.toMatchObject({
+      data: { rows: [{ id: 'json' }] },
+    });
+    expect(decodeRows).not.toHaveBeenCalled();
+    transport.dispose();
+  });
+  it.each([
+    ['a body the decoder declines', request, '<other/>'],
+    ['a route without the opt-in', plain, '<rows>a</rows>'],
+  ])('keeps the invalid-JSON failure for %s without retrying', async (_case, load, body) => {
+    const network = vi.fn<typeof fetch>().mockImplementation(async () => new Response(body));
+    const transport = new RiksdagTransport(network);
+    using budget = createToolBudget();
+    await expect(transport.load(transport.url(spec.path), load, budget)).rejects.toMatchObject({
+      message: 'Riksdagen returned invalid JSON.',
+      data: { reason: 'upstream_schema_invalid', retryable: false },
+    });
+    expect(network).toHaveBeenCalledTimes(1);
+    transport.dispose();
+  });
+  it('rejects a decoded value that fails the endpoint schema', async () => {
+    const transport = new RiksdagTransport(async () => new Response('<rows></rows>'));
+    using budget = createToolBudget();
+    await expect(
+      transport.load(
+        transport.url(spec.path),
+        { ...request, decodeNonJson: () => ({ rows: [] }) },
+        budget,
+      ),
+    ).rejects.toMatchObject({
+      message: 'The Riksdagen response does not match the endpoint wire contract.',
+      data: { reason: 'upstream_schema_invalid' },
+    });
+    transport.dispose();
+  });
+});
+
 describe('validated service cache', () => {
   it('reparses cached wire data once per read, preserves timestamps and isolates caller mutation', async () => {
     vi.useFakeTimers();
@@ -345,6 +429,19 @@ describe('validated service cache', () => {
     await service.loadJson(request, budget);
     await service.loadJson(request, budget);
     expect(network).toHaveBeenCalledTimes(4);
+    service.dispose();
+  });
+  it('rejects a caller who cancels while the derived value is computed', async () => {
+    const service = new RiksdagService({ fetch: async () => Response.json({ id: 'ok' }) });
+    const caller = new AbortController();
+    using budget = createToolBudget(caller.signal);
+    const derive = ({ id }: { id: string }) => {
+      caller.abort();
+      return id;
+    };
+    await expect(
+      service.loadJsonDerived({ ...spec, cacheable: () => true }, budget, derive),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
     service.dispose();
   });
 });

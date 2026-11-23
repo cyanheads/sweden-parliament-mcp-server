@@ -6,8 +6,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { riksdagSearchSpeeches } from '@/mcp-server/tools/definitions/search-speeches.tool.js';
 import { successEnrichment } from '@/services/riksdag/output.js';
 import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksdag-service.js';
+import { speechSchema } from '@/services/riksdag/speeches.js';
 import { continuationArgs } from '../services/riksdag/continuation-fixtures.js';
-import { relatedSpeechRows, speechList, speechRow } from '../services/riksdag/speech-fixtures.js';
+import {
+  detailRecord,
+  duplicatedRows,
+  duplicateUuids,
+  publishedListRow,
+  relatedSpeechRows,
+  speechList,
+  speechRow,
+  speechXml,
+  xmlDetailRecord,
+} from '../services/riksdag/speech-fixtures.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -105,9 +116,9 @@ describe('speech public contract', () => {
     expect(explicitTail.item).toMatchObject({ textReturnedLength: 4000, textHasMore: false });
     expect(explicit.item!.text! + explicitTail.item!.text).toBe(body);
   });
-  it('returns the clamped limit of rows and default 8000-code-point hydrated pages on heavy sessions', async () => {
-    const body = 'Å😀x'.repeat(3000);
-    const fixture = speechList(25);
+  /** A heavy session of `count` speeches whose details each carry a 9000-code-point body. */
+  function heavySession(count: number, body: string) {
+    const fixture = speechList(count);
     for (const row of fixture.anforandelista.anforande) {
       row.avsnittsrubrik = `Utgiftsområde 6 Försvar och samhällets krisberedskap ${'å'.repeat(300)}`;
       row.talare = `Försvarsminister Synthetic Speaker ${'ö'.repeat(120)}`;
@@ -120,28 +131,36 @@ describe('speech public contract', () => {
       });
     });
     initRiksdagService({ fetch: network });
+    return network;
+  }
+
+  it('returns the clamped limit of rows and default 8000-code-point hydrated pages on heavy sessions', async () => {
+    const body = 'Å😀x'.repeat(3000);
+    const network = heavySession(125, body);
     const result = await runToolContract(riksdagSearchSpeeches, {
       session: '2024/25',
-      limit: 20,
+      limit: 120,
       textCount: 5,
     });
     const page = success(result);
     const { notices } = z.object(successEnrichment).parse(result.structuredContent);
     expect(page).toMatchObject({
-      returnedCount: 20,
-      requestedLimit: 20,
-      limit: 20,
+      returnedCount: 100,
+      requestedLimit: 120,
+      limit: 100,
       textCount: 5,
-      totalCount: 25,
+      totalCount: 125,
       hasMore: true,
-      nextCall: { args: { offset: 20, limit: 20, textCount: 5, revision: page.revision } },
+      nextCall: { args: { offset: 100, limit: 100, textCount: 5, revision: page.revision } },
     });
+    expect(notices).toContain('Requested limit was clamped to 100.');
     expect(page).not.toHaveProperty('truncated');
     expect(notices.filter((notice) => /shortened|response target/.test(notice))).toEqual([]);
     expect(page.items?.map((item) => item.textState)).toEqual([
       ...Array(5).fill('included'),
-      ...Array(15).fill('not_requested'),
+      ...Array(95).fill('not_requested'),
     ]);
+    expect(network).toHaveBeenCalledTimes(6);
     for (const item of page.items!.slice(0, 5)) {
       expect(item).toMatchObject({
         textOffset: 0,
@@ -153,13 +172,60 @@ describe('speech public contract', () => {
       expect(item.text).toBe(`${'Å😀x'.repeat(2666)}Å😀`);
     }
     const rest = await followed(page.nextCall);
-    expect(rest).toMatchObject({ returnedCount: 5, offset: 20, limit: 20, hasMore: false });
+    expect(rest).toMatchObject({ returnedCount: 25, offset: 100, limit: 100, hasMore: false });
     expect(rest.items?.map((item) => item.speechId)).toEqual(
-      [21, 22, 23, 24, 25].map((number) => `HC091-${number}`),
+      Array.from({ length: 25 }, (_, index) => `HC091-${101 + index}`),
     );
     const tail = await followed(page.items![0]!.nextTextCall);
     expect(page.items![0]!.text! + tail.item!.text).toBe(body);
     expect(tail.item).toMatchObject({ textReturnedLength: 1000, textHasMore: false });
+  });
+  it.each([21, 58, 100])('honors limit %i without a clamp notice', async (limit) => {
+    heavySession(125, 'Body');
+    const result = await runToolContract(riksdagSearchSpeeches, {
+      session: '2024/25',
+      limit,
+      textCount: 0,
+    });
+    expect(success(result)).toMatchObject({
+      returnedCount: limit,
+      requestedLimit: limit,
+      limit,
+      hasMore: true,
+      nextCall: { args: { offset: limit, limit } },
+    });
+    expect(
+      z
+        .object(successEnrichment)
+        .parse(result.structuredContent)
+        .notices.filter((notice) => notice.includes('clamped')),
+    ).toEqual([]);
+  });
+  it('walks the same rows, revision and counts at limit 100 as at limit 20', async () => {
+    heavySession(125, 'Body');
+    const walks = [];
+    for (const limit of [20, 100]) {
+      const first = success(
+        await runToolContract(riksdagSearchSpeeches, { session: '2024/25', limit, textCount: 0 }),
+      );
+      const reached = [];
+      let page = first;
+      for (;;) {
+        expect(page).toMatchObject({
+          revision: first.revision,
+          candidateCount: 125,
+          totalCount: 125,
+        });
+        reached.push(...(page.items ?? []).map((item) => item.speechId));
+        if (!page.nextCall) break;
+        page = await followed(page.nextCall);
+      }
+      walks.push({ revision: first.revision, reached });
+    }
+    expect(walks[1]).toEqual(walks[0]);
+    expect(walks[0]?.reached).toEqual(
+      Array.from({ length: 125 }, (_, index) => `HC091-${index + 1}`),
+    );
   });
   it('hydrates every selected text at the default page and reconstructs it through continuations', async () => {
     const body = 'Å😀x'.repeat(5000);
@@ -389,7 +455,7 @@ describe('speech public contract', () => {
       },
     });
   });
-  it.each([20, 21])(
+  it.each([100, 101])(
     'clamps limit %i and textCount at 5 while hydrating sequentially',
     async (limit) => {
       const calls: string[] = [];
@@ -404,8 +470,8 @@ describe('speech public contract', () => {
           if (String(url).includes('anforandelista'))
             return Response.json({
               anforandelista: {
-                '@antal': '21',
-                anforande: Array.from({ length: 21 }, (_, index) => ({
+                '@antal': '101',
+                anforande: Array.from({ length: 101 }, (_, index) => ({
                   dok_id: 'HC091',
                   anforande_nummer: String(index + 1),
                 })),
@@ -425,10 +491,10 @@ describe('speech public contract', () => {
         await runToolContract(riksdagSearchSpeeches, { session: '2024/25', limit, textCount: 6 }),
       );
       expect(page).toMatchObject({
-        limit: 20,
+        limit: 100,
         requestedLimit: limit,
         textCount: 5,
-        returnedCount: 20,
+        returnedCount: 100,
         hasMore: true,
       });
       expect(page.items?.slice(0, 5).every((item) => item.textState === 'included')).toBe(true);
@@ -747,4 +813,268 @@ describe('speech related-document filter', () => {
       'No speeches in this session link to relatedDocumentId under these filters. A report decided without debate has no speeches; check the document ID and its session with riksdag_get_document, or remove relatedDocumentId to browse the session.',
     );
   });
+});
+
+describe('duplicated source speeches', () => {
+  const collapseNotice =
+    'Collapsed 2 duplicate source rows: the source publishes some speeches twice under one speechId, identical apart from the source UUID; each is counted and listed once, keeping the lowest sourceSpeechId.';
+
+  /**
+   * A session listing speeches 2 and 4 twice, the higher source UUID first for one of them, with the
+   * doubled XML detail bodies the source serves for those two. Speeches 2–4 share a debate.
+   */
+  function duplicatedSession(highestFirst = false) {
+    const rows = [
+      speechRow(1),
+      ...duplicatedRows(2, highestFirst),
+      speechRow(3),
+      ...duplicatedRows(4, !highestFirst),
+      speechRow(5),
+    ].map((row) =>
+      ['2', '3', '4'].includes(row.anforande_nummer)
+        ? { ...row, rel_dok_id: 'HC10698', avsnittsrubrik: 'Försvar och krisberedskap' }
+        : row,
+    );
+    const network = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+      if (String(url).includes('anforandelista'))
+        return Response.json({
+          anforandelista: { '@antal': String(rows.length), anforande: rows },
+        });
+      const number = /-(\d+)\.json/.exec(String(url))?.[1];
+      const copies = rows.filter((row) => row.anforande_nummer === number);
+      const anforandetext = `<p>Body ${number}</p>`;
+      return copies.length > 1
+        ? new Response(speechXml(copies.map((row) => xmlDetailRecord(row, anforandetext))), {
+            headers: { 'content-type': 'application/json; charset=utf-8' },
+          })
+        : Response.json({ anforande: { ...copies[0], anforandetext } });
+    });
+    initRiksdagService({ fetch: network });
+    return network;
+  }
+
+  it('counts and pages each duplicated speech once with a collapse notice on both surfaces', async () => {
+    duplicatedSession();
+    const result = await runToolContract(riksdagSearchSpeeches, {
+      session: '2024/25',
+      limit: 2,
+      textCount: 0,
+    });
+    const first = success(result);
+    expect(first).toMatchObject({ candidateCount: 5, totalCount: 5, returnedCount: 2 });
+    expect(z.object(successEnrichment).parse(result.structuredContent).notices).toContain(
+      collapseNotice,
+    );
+    const reached = [];
+    let page = first;
+    for (;;) {
+      reached.push(...(page.items ?? []).map((item) => [item.speechId, item.sourceSpeechId]));
+      if (!page.nextCall) break;
+      page = await followed(page.nextCall);
+      expect(page).toMatchObject({ candidateCount: 5, totalCount: 5, revision: first.revision });
+    }
+    expect(reached).toEqual([
+      ['HC091-1', 'synthetic-uuid-1'],
+      ['HC091-2', duplicateUuids(2).lowest],
+      ['HC091-3', 'synthetic-uuid-3'],
+      ['HC091-4', duplicateUuids(4).lowest],
+      ['HC091-5', 'synthetic-uuid-5'],
+    ]);
+  });
+  it('names a single collapsed duplicate row in the singular', async () => {
+    const rows = [speechRow(1), ...duplicatedRows(2)];
+    initRiksdagService({
+      fetch: async () => Response.json({ anforandelista: { '@antal': '3', anforande: rows } }),
+    });
+    const result = await runToolContract(riksdagSearchSpeeches, {
+      session: '2024/25',
+      textCount: 0,
+    });
+    expect(success(result)).toMatchObject({ candidateCount: 2, totalCount: 2 });
+    expect(z.object(successEnrichment).parse(result.structuredContent).notices).toContain(
+      'Collapsed 1 duplicate source row: the source publishes some speeches twice under one speechId, identical apart from the source UUID; each is counted and listed once, keeping the lowest sourceSpeechId.',
+    );
+  });
+  it('returns the same items and revision whichever copy the source lists first', async () => {
+    const pages = [];
+    for (const highestFirst of [false, true]) {
+      duplicatedSession(highestFirst);
+      pages.push(
+        success(
+          await runToolContract(riksdagSearchSpeeches, {
+            session: '2024/25',
+            limit: 5,
+            textCount: 0,
+          }),
+        ),
+      );
+    }
+    expect(pages[1]).toEqual(pages[0]);
+  });
+  it('applies relatedDocumentId and headingContains to the collapsed set', async () => {
+    duplicatedSession();
+    const related = success(
+      await runToolContract(riksdagSearchSpeeches, {
+        session: '2024/25',
+        relatedDocumentId: 'HC10698',
+        textCount: 0,
+      }),
+    );
+    expect(related).toMatchObject({ candidateCount: 5, totalCount: 3, hasMore: false });
+    expect(related.items?.map((item) => item.speechId)).toEqual(['HC091-2', 'HC091-3', 'HC091-4']);
+    const reached = [];
+    let page = success(
+      await runToolContract(riksdagSearchSpeeches, {
+        session: '2024/25',
+        headingContains: 'försvar',
+        textCount: 0,
+        limit: 1,
+      }),
+    );
+    expect(page).toMatchObject({ totalCount: 3 });
+    for (;;) {
+      reached.push(...(page.items ?? []).map((item) => item.speechId));
+      if (!page.nextCall) break;
+      page = await followed(page.nextCall);
+    }
+    expect(reached).toEqual(['HC091-2', 'HC091-3', 'HC091-4']);
+  });
+  it('reads a doubled detail in get mode with the search row sourceSpeechId and serves it from cache within 300 s', async () => {
+    vi.useFakeTimers();
+    const network = duplicatedSession();
+    const search = success(
+      await runToolContract(riksdagSearchSpeeches, {
+        session: '2024/25',
+        offset: 1,
+        limit: 1,
+        textCount: 0,
+      }),
+    );
+    const get = success(
+      await runToolContract(riksdagSearchSpeeches, { mode: 'get', speechId: 'HC091-2' }),
+    );
+    expect(get).toMatchObject({
+      found: true,
+      item: {
+        speechId: 'HC091-2',
+        textState: 'included',
+        text: 'Body 2',
+        sourceSpeechId: search.items?.[0]?.sourceSpeechId,
+      },
+    });
+    expect(get.item?.sourceSpeechId).toBe(duplicateUuids(2).lowest);
+    const requests = network.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(299_000);
+    expect(
+      success(await runToolContract(riksdagSearchSpeeches, { mode: 'get', speechId: 'HC091-2' })),
+    ).toEqual(get);
+    expect(network).toHaveBeenCalledTimes(requests);
+  });
+  it('hydrates duplicated speeches in search', async () => {
+    duplicatedSession(true);
+    const page = success(
+      await runToolContract(riksdagSearchSpeeches, {
+        session: '2024/25',
+        offset: 1,
+        limit: 3,
+        textCount: 3,
+      }),
+    );
+    expect(page.items?.map((item) => [item.speechId, item.textState, item.text])).toEqual([
+      ['HC091-2', 'included', 'Body 2'],
+      ['HC091-3', 'included', 'Body 3'],
+      ['HC091-4', 'included', 'Body 4'],
+    ]);
+  });
+});
+
+describe('speech hydration metadata', () => {
+  const textKeys = [
+    'textState',
+    'text',
+    'textOffset',
+    'textTotalLength',
+    'textReturnedLength',
+    'textHasMore',
+    'textRevision',
+    'nextTextCall',
+  ];
+  /** Field names a serialized item carries: keys holding a value. */
+  const fields = (value: object | undefined) =>
+    Object.entries(value ?? {})
+      .filter(([, item]) => item !== undefined)
+      .map(([key]) => key)
+      .sort();
+
+  /** List rows and the differing detail records the source serves for them. */
+  function publishedSession(anforandetext: string) {
+    const rows = [1, 2, 3].map(publishedListRow);
+    const network = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+      if (String(url).includes('anforandelista'))
+        return Response.json({ anforandelista: { '@antal': '3', anforande: rows } });
+      const number = Number(/-(\d+)\.json/.exec(String(url))?.[1]);
+      return Response.json({ anforande: { ...detailRecord(rows[number - 1]!), anforandetext } });
+    });
+    initRiksdagService({ fetch: network });
+    return network;
+  }
+
+  it('returns the detail record metadata in get mode', async () => {
+    publishedSession('<p>Body</p>');
+    const get = success(
+      await runToolContract(riksdagSearchSpeeches, { mode: 'get', speechId: 'HC091-1' }),
+    );
+    expect(get.item).toMatchObject({
+      date: '2024-09-10 00:00:00',
+      protocolUrl:
+        'https://www.riksdagen.se/sv/dokument-och-lagar/dokument/protokoll/protokoll_HC091/#anf1',
+    });
+    expect(get.item?.sourceHtmlUrl).toBeUndefined();
+  });
+  it.each([
+    ['included', `<p>${'Å😀x'.repeat(3000)}</p>`, textKeys],
+    ['unavailable', '', ['textState', 'textRevision']],
+  ])(
+    'keeps the search row metadata on an %s hydrated item and adds only text fields',
+    async (textState, anforandetext, added) => {
+      publishedSession(anforandetext);
+      const metadata = success(
+        await runToolContract(riksdagSearchSpeeches, {
+          session: '2024/25',
+          limit: 2,
+          textCount: 0,
+        }),
+      );
+      const page = success(
+        await runToolContract(riksdagSearchSpeeches, {
+          session: '2024/25',
+          limit: 2,
+          textCount: 1,
+        }),
+      );
+      const [hydrated, deferred] = page.items!;
+      expect(hydrated?.textState).toBe(textState);
+      expect(deferred?.textState).toBe('not_requested');
+      expect(speechSchema.parse(hydrated)).toEqual(speechSchema.parse(metadata.items![0]));
+      expect(speechSchema.parse(hydrated)).toMatchObject({
+        date: '2024-09-10',
+        sourceHtmlUrl: 'https://data.riksdagen.se/anforande/HC091-1/html',
+        protocolUrl:
+          'https://www.riksdagen.se/sv/dokument-och-lagar/dokument/protokoll/protokoll-2024251-tisdagen-den-10-september_HC091/#anf1',
+      });
+      expect(fields(hydrated)).toEqual(
+        [...fields(speechSchema.parse(metadata.items![0])), ...added].sort(),
+      );
+      expect(fields(speechSchema.parse(hydrated))).toEqual(fields(speechSchema.parse(deferred)));
+      const get = success(
+        await runToolContract(riksdagSearchSpeeches, { mode: 'get', speechId: 'HC091-1' }),
+      );
+      expect(hydrated?.textRevision).toBe(get.revision);
+      if (textState === 'included') {
+        const tail = await followed(hydrated?.nextTextCall);
+        expect(tail.item).toMatchObject({ textOffset: 8000, textHasMore: false });
+        expect(hydrated!.text! + tail.item!.text).toBe('Å😀x'.repeat(3000));
+      }
+    },
+  );
 });

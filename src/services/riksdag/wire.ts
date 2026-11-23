@@ -69,11 +69,10 @@ export function sourceUrl(value: string): string {
   return url.href;
 }
 
-/** Validates completeness and unique stable identities before filtering or caching. */
-export function assertCompleteCandidates<T>(
-  rows: T[],
+/** Validates the raw rows of a complete candidate response against saturation and its returned-row count. */
+export function assertCompleteCount(
+  rows: readonly unknown[],
   returnedCount: number | undefined,
-  identity: (row: T) => string,
 ): void {
   if (rows.length >= 50_000 || (returnedCount !== undefined && returnedCount >= 50_000)) {
     throw new McpError(
@@ -86,6 +85,15 @@ export function assertCompleteCandidates<T>(
     throw schemaInvalid(
       'The source returned-row count does not match the complete candidate response.',
     );
+}
+
+/** Validates completeness and unique stable identities before filtering or caching. */
+export function assertCompleteCandidates<T>(
+  rows: T[],
+  returnedCount: number | undefined,
+  identity: (row: T) => string,
+): void {
+  assertCompleteCount(rows, returnedCount);
   const identities = new Set<string>();
   for (const row of rows) {
     const key = identity(row);

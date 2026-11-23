@@ -21,11 +21,15 @@ import {
   toolCallSchema,
 } from '../../../services/riksdag/output.js';
 import { pageText } from '../../../services/riksdag/pagination.js';
-import { getRiksdagService } from '../../../services/riksdag/riksdag-service.js';
+import {
+  getRiksdagService,
+  type RiksdagService,
+} from '../../../services/riksdag/riksdag-service.js';
 import {
   linksDocument,
   loadSpeechCandidates,
   loadSpeechDetail,
+  type Speech,
   speechSchema,
 } from '../../../services/riksdag/speeches.js';
 import { assertRevision, codePointLength, revisionOf } from '../../../services/riksdag/text.js';
@@ -67,7 +71,7 @@ const argsSchema = z.object({
     .int()
     .min(1)
     .optional()
-    .describe('Search only: requested rows, default 5 and applied maximum 20.'),
+    .describe('Search only: requested rows, default 5 and applied maximum 100.'),
   textCount: z
     .number()
     .int()
@@ -143,8 +147,13 @@ function getCall(speechId: string, textOffset?: number, revision?: string, textL
   };
 }
 
-/** One canonical body page of a found detail record, for get mode and search hydration alike. */
+/**
+ * One canonical body page of a found detail record on a metadata base: the detail record in get
+ * mode, the search row in hydration. The revision always covers the detail record and body, the
+ * value get mode recomputes, so a hydrated `nextTextCall` continues unchanged.
+ */
 async function detailPage(
+  metadata: Speech,
   loaded: Extract<Awaited<ReturnType<typeof loadSpeechDetail>>, { found: true }>,
   offset: number,
   length: number | undefined,
@@ -156,7 +165,7 @@ async function detailPage(
   assertRevision(expectedRevision, revision);
   budget.check();
   if (loaded.text === undefined || loaded.text.trim() === '')
-    return { ...loaded.record, textState: 'unavailable', textRevision: revision };
+    return { ...metadata, textState: 'unavailable', textRevision: revision };
   const total = codePointLength(loaded.text);
   return pageText({
     text: loaded.text,
@@ -167,7 +176,7 @@ async function detailPage(
     build: (text, returnedLength): Item => {
       const hasMore = offset + returnedLength < total;
       return {
-        ...loaded.record,
+        ...metadata,
         textState: 'included',
         text,
         textOffset: offset,
@@ -211,6 +220,42 @@ function transient(error: unknown): error is McpError {
   );
 }
 
+/** A search row before hydration, with the get call that reads its text. */
+function deferredItem(row: Speech): Item {
+  return { ...row, textState: 'not_requested', nextTextCall: getCall(row.speechId) };
+}
+
+/**
+ * Hydrates one search row with its first text page. The row keeps its own metadata; the detail
+ * supplies only text fields. A transient detail failure becomes an explicit item state.
+ */
+async function hydrated(
+  service: RiksdagService,
+  row: Speech,
+  enrichment: SuccessEnrichment,
+  budget: ToolBudget,
+): Promise<Item> {
+  budget.check();
+  try {
+    const detail = await loadSpeechDetail(service, budget, row.speechId);
+    return detail.found
+      ? await detailPage(row, detail, 0, undefined, undefined, enrichment, budget)
+      : { ...deferredItem(row), textState: 'unavailable' };
+  } catch (error) {
+    budget.check();
+    if (!transient(error)) throw error;
+    return {
+      ...deferredItem(row),
+      textState: 'failed',
+      textFailure: {
+        code: error.code,
+        reason: typeof error.data?.reason === 'string' ? error.data.reason : 'upstream_unavailable',
+        recovery: 'Retry the included get-mode nextTextCall to retrieve this speech body.',
+      },
+    };
+  }
+}
+
 /** Searches complete scoped speech candidates or retrieves one speech's canonical body. */
 export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
   title: 'Search and read parliamentary speeches',
@@ -228,7 +273,10 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
       .array(itemSchema)
       .optional()
       .describe('Search mode: speech page after local heading and related-document filters.'),
-    candidateCount: z.number().optional().describe('Validated upstream candidate count.'),
+    candidateCount: z
+      .number()
+      .optional()
+      .describe('Validated upstream candidate count, each speechId once.'),
     totalCount: z
       .number()
       .optional()
@@ -353,6 +401,7 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
         };
       }
       const item = await detailPage(
+        loaded.record,
         loaded,
         filters.textOffset,
         input.textLength,
@@ -374,10 +423,10 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
       ...(heading ? { headingContains: heading } : {}),
       ...(related ? { relatedDocumentId: normalizeDocumentId(related, 'relatedDocumentId') } : {}),
       ...(member ? { memberId: normalizeMemberId(member) } : {}),
-      ...(party ? { party: normalizeCode(party, 'parties') } : {}),
+      ...(party ? { party: normalizeCode(party, 'parties', 'party') } : {}),
       speechType: input.speechType ?? 'all',
       offset: input.offset ?? 0,
-      limit: Math.min(input.limit ?? 5, 20),
+      limit: Math.min(input.limit ?? 5, 100),
       textCount: Math.min(input.textCount ?? 1, 5),
     };
     const tokens = heading ? normalizeTokens(heading) : [];
@@ -397,9 +446,13 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
         'headingContains matches heading and subheading tokens locally; speech body text is not searched. The total describes the complete validated source candidate response.',
       ],
     };
-    if ((input.limit ?? 5) > 20) enrichment.notices.push('Requested limit was clamped to 20.');
+    if ((input.limit ?? 5) > 100) enrichment.notices.push('Requested limit was clamped to 100.');
     if ((input.textCount ?? 1) > 5)
       enrichment.notices.push('Requested textCount was clamped to 5.');
+    if (loaded.collapsedCount > 0)
+      enrichment.notices.push(
+        `Collapsed ${loaded.collapsedCount} duplicate source ${loaded.collapsedCount === 1 ? 'row' : 'rows'}: the source publishes some speeches twice under one speechId, identical apart from the source UUID; each is counted and listed once, keeping the lowest sourceSpeechId.`,
+      );
     if (!rows.length)
       enrichment.notices.push(
         filters.relatedDocumentId === undefined
@@ -407,37 +460,13 @@ export const riksdagSearchSpeeches = tool('riksdag_search_speeches', {
           : 'No speeches in this session link to relatedDocumentId under these filters. A report decided without debate has no speeches; check the document ID and its session with riksdag_get_document, or remove relatedDocumentId to browse the session.',
       );
     budget.check();
-    const items = rows.slice(filters.offset, filters.offset + filters.limit).map(
-      (row): Item => ({
-        ...row,
-        textState: 'not_requested',
-        nextTextCall: getCall(row.speechId),
-      }),
-    );
-    for (const [index, item] of items.entries()) {
-      if (index >= filters.textCount) break;
-      budget.check();
-      try {
-        const detail = await loadSpeechDetail(service, budget, item.speechId);
-        items[index] = detail.found
-          ? await detailPage(detail, 0, undefined, undefined, enrichment, budget)
-          : { ...item, textState: 'unavailable' };
-      } catch (error) {
-        budget.check();
-        if (!transient(error)) throw error;
-        items[index] = {
-          ...item,
-          textState: 'failed',
-          textFailure: {
-            code: error.code,
-            reason:
-              typeof error.data?.reason === 'string' ? error.data.reason : 'upstream_unavailable',
-            recovery: 'Retry the included get-mode nextTextCall to retrieve this speech body.',
-          },
-          nextTextCall: getCall(item.speechId),
-        };
-      }
-    }
+    const items: Item[] = [];
+    for (const [index, row] of rows.slice(filters.offset, filters.offset + filters.limit).entries())
+      items.push(
+        index < filters.textCount
+          ? await hydrated(service, row, enrichment, budget)
+          : deferredItem(row),
+      );
     const hasMore = filters.offset + items.length < rows.length;
     budget.check();
     ctx.enrich(enrichment);

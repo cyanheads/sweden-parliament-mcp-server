@@ -214,4 +214,25 @@ describe('speech input contract', () => {
     expect(JSON.stringify(result)).not.toContain('Invalid documentId');
     expect(network).not.toHaveBeenCalled();
   });
+  it('names the party field when a party code is unknown', async () => {
+    const message = 'Invalid party; use riksdag_list_reference to check its format or code.';
+    const network = vi.fn<typeof fetch>();
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagSearchSpeeches, {
+      session: '2024/25',
+      party: 'xyz',
+    });
+    expect(result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          message,
+          data: { reason: 'invalid_filter', field: 'party' },
+        },
+      },
+    });
+    expect(JSON.stringify(result.content)).toContain(message);
+    expect(network).not.toHaveBeenCalled();
+  });
 });

@@ -58,6 +58,12 @@ export type QueryParameters = Readonly<Record<string, string | number | undefine
 /** Validation and expected-miss policy belong to the owning endpoint module. */
 export interface JsonLoadSpec<S extends z.ZodType> {
   cacheable?: (data: z.output<S>) => boolean;
+  /**
+   * Endpoint-owned decoder for a body that is not JSON, called only after `JSON.parse` fails. Its value
+   * goes through `schema` and is cached as its JSON serialization; `undefined` keeps the invalid-JSON
+   * failure.
+   */
+  decodeNonJson?: (text: string) => unknown;
   expected404?: boolean;
   expectedEmpty200?: boolean;
   path: string;
@@ -174,15 +180,19 @@ export class RiksdagTransport {
                   );
                 }
                 let parsed: unknown;
+                let wireJson = text;
                 try {
                   parsed = JSON.parse(text);
                 } catch (cause) {
-                  throw new McpError(
-                    JsonRpcErrorCode.SerializationError,
-                    'Riksdagen returned invalid JSON.',
-                    { reason: 'upstream_schema_invalid', retryable: false },
-                    { cause },
-                  );
+                  parsed = spec.decodeNonJson?.(text);
+                  if (parsed === undefined)
+                    throw new McpError(
+                      JsonRpcErrorCode.SerializationError,
+                      'Riksdagen returned invalid JSON.',
+                      { reason: 'upstream_schema_invalid', retryable: false },
+                      { cause },
+                    );
+                  wireJson = JSON.stringify(parsed);
                 }
                 const result = spec.schema.safeParse(parsed);
                 budget.check();
@@ -190,7 +200,7 @@ export class RiksdagTransport {
                   throw schemaInvalid(
                     'The Riksdagen response does not match the endpoint wire contract.',
                   );
-                return { found: true as const, data: result.data, retrievedAt, wireJson: text };
+                return { found: true as const, data: result.data, retrievedAt, wireJson };
               } catch (cause) {
                 budget.check();
                 if (controller.signal.aborted)
