@@ -16,6 +16,7 @@
 /changelog/
 /framework-skills/
 /.cache/
+/node_modules/.vitest-cache/
 /coverage/
 /tests/
 /src/
