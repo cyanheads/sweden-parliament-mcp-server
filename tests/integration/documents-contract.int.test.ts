@@ -8,9 +8,21 @@ import { riksdagSearchDocuments } from '@/mcp-server/tools/definitions/search-do
 import { riksdagSearchSpeeches } from '@/mcp-server/tools/definitions/search-speeches.tool.js';
 import { successEnrichment } from '@/services/riksdag/output.js';
 import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksdag-service.js';
+import { htmlToMarkdown } from '@/services/riksdag/text.js';
 import { continuationArgs } from '../services/riksdag/continuation-fixtures.js';
-import { reportFixture } from '../services/riksdag/document-fixtures.js';
+import {
+  convertedReport,
+  convertedReportRevision,
+  reportFixture,
+} from '../services/riksdag/document-fixtures.js';
 import { speechRow } from '../services/riksdag/speech-fixtures.js';
+
+/** Counts converter calls below the service cache; every call still runs the real converter. */
+vi.mock('@/services/riksdag/text.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/riksdag/text.js')>();
+  return { ...actual, htmlToMarkdown: vi.fn(actual.htmlToMarkdown) };
+});
+const converter = vi.mocked(htmlToMarkdown);
 
 afterEach(() => {
   vi.useRealTimers();
@@ -573,37 +585,31 @@ describe('document public contract', () => {
     expect(domainText(result)).toEqual(page);
     expect(enrichment.notices).toEqual([]);
   });
-  it('clamps remote page size and returns every fetched row of the final page', async () => {
-    initRiksdagService({
-      fetch: async () =>
-        Response.json({
-          dokumentlista: {
-            '@traffar': '50',
-            dokument: Array.from({ length: 50 }, (_, i) => ({ dok_id: `HC01KU${i + 1}` })),
-          },
-        }),
-    });
-    const result = await runToolContract(riksdagSearchDocuments, { pageSize: 100000 });
-    expect(assertSuccess(result).notices.join(' ')).toContain('clamped to 50');
-    const first = riksdagSearchDocuments.output.parse(result.structuredContent);
-    expect(first.pageSize).toBe(50);
-    expect(first.remoteReturnedCount).toBe(50);
-    expect(first).toMatchObject({ returnedCount: 50, hasMore: false });
-    expect(first.nextCall).toBeUndefined();
-    const ids = first.items.map((row) => row.documentId);
-    let next = first.nextCall;
-    while (next) {
-      expect(next.args).toMatchObject({ page: 1, pageSize: 50, revision: first.revision });
-      const continued = await runToolContract(riksdagSearchDocuments, next.args);
-      const page = riksdagSearchDocuments.output.parse(continued.structuredContent);
-      expect(domainText(continued)).toEqual(page);
-      ids.push(...page.items.map((row) => row.documentId));
-      next = page.nextCall;
-    }
-    expect(ids).toEqual(Array.from({ length: 50 }, (_, i) => `HC01KU${i + 1}`));
-    expect(domainText(result)).toEqual(
-      riksdagSearchDocuments.output.parse(result.structuredContent),
+  it('clamps remote page size to 200 and returns every fetched row of the final page', async () => {
+    const network = vi.fn<typeof fetch>().mockImplementation(async () =>
+      Response.json({
+        dokumentlista: {
+          '@traffar': '200',
+          dokument: Array.from({ length: 200 }, (_, i) => ({ dok_id: `HC01KU${i + 1}` })),
+        },
+      }),
     );
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagSearchDocuments, { pageSize: 100000 });
+    expect(assertSuccess(result).notices).toContain('Requested pageSize was clamped to 200.');
+    expect(new URL(String(network.mock.calls[0]?.[0])).searchParams.get('sz')).toBe('200');
+    const first = riksdagSearchDocuments.output.parse(result.structuredContent);
+    expect(first).toMatchObject({
+      pageSize: 200,
+      returnedCount: 200,
+      remoteReturnedCount: 200,
+      hasMore: false,
+    });
+    expect(first.nextCall).toBeUndefined();
+    expect(first.items.map((row) => row.documentId)).toEqual(
+      Array.from({ length: 200 }, (_, i) => `HC01KU${i + 1}`),
+    );
+    expect(domainText(result)).toEqual(first);
   });
   it('traverses every independently selected nested section beyond the first page', async () => {
     initRiksdagService({ fetch: async () => Response.json(reportFixture()) });
@@ -955,6 +961,382 @@ describe('document public contract', () => {
   });
 });
 
+const convertedReportCall: z.input<typeof riksdagGetDocument.input> = {
+  documentId: 'HC01KU1',
+  sections: ['metadata', 'text', 'decisions', 'properties'],
+  textLength: 5,
+};
+describe('document conversions across calls', () => {
+  it('characterizes the converted record a call returns', async () => {
+    initRiksdagService({ fetch: async () => Response.json(convertedReport()) });
+    const result = await runToolContract(riksdagGetDocument, convertedReportCall);
+    assertSuccess(result);
+    const page = riksdagGetDocument.output.parse(result.structuredContent);
+    expect(domainText(result)).toEqual(page);
+    expect({
+      revision: page.revision,
+      outline: page.outline,
+      text: page.text,
+      textTotalLength: page.textTotalLength,
+      nextTextCall: page.nextTextCall,
+      proposals: page.decisions?.map((decision) => decision.proposal),
+      properties: page.properties,
+    }).toEqual({
+      revision: convertedReportRevision,
+      outline: [
+        { section: 'metadata', available: true, itemCount: 1 },
+        { section: 'decisions', available: true, itemCount: 2 },
+        { section: 'reservations', available: true, itemCount: 2 },
+        { section: 'activities', available: true, itemCount: 2 },
+        { section: 'properties', available: true, itemCount: 3 },
+        { section: 'attachments', available: true, itemCount: 2 },
+        { section: 'references', available: true, itemCount: 2 },
+        { section: 'stakeholders', available: false, itemCount: 0 },
+        { section: 'text', available: true, textLength: 43 },
+        { section: 'source_html', available: true, textLength: 60 },
+      ],
+      text: '# Rub',
+      textTotalLength: 43,
+      nextTextCall: {
+        toolName: 'riksdag_get_document',
+        args: {
+          documentId: 'HC01KU1',
+          sections: ['text'],
+          textOffset: 5,
+          textLength: 5,
+          htmlOffset: 0,
+          sectionOffset: 0,
+          sectionLimit: 20,
+          revision: convertedReportRevision,
+        },
+      },
+      proposals: ['Förslag 1', 'Förslag 2'],
+      properties: [
+        { code: 'arendestatuskammaren', name: 'Avgjort', text: 'Kammarens uppgift' },
+        { code: 'P2', name: 'Egenskap 2', text: 'Värde 2' },
+        {
+          code: 'notis',
+          name: 'Notis',
+          text: '**Kort** notis med [länk](<https://data.riksdagen.se/dokument/HC01KU1>)',
+          sourceHtml: '<p><b>Kort</b> notis med <a href="/dokument/HC01KU1">länk</a></p>',
+        },
+      ],
+    });
+  });
+  it('repeats a call on a cached record without converting or fetching, identically on both surfaces', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => Response.json(convertedReport()));
+    initRiksdagService({ fetch: network });
+    converter.mockClear();
+    const first = await runToolContract(riksdagGetDocument, convertedReportCall);
+    assertSuccess(first);
+    // One body, two proposals and one notice property.
+    expect(converter).toHaveBeenCalledTimes(4);
+    const repeat = await runToolContract(riksdagGetDocument, convertedReportCall);
+    expect(converter).toHaveBeenCalledTimes(4);
+    expect(network).toHaveBeenCalledTimes(1);
+    expect(repeat.structuredContent).toEqual(first.structuredContent);
+    expect(repeat.content).toEqual(first.content);
+    expect(riksdagGetDocument.output.parse(repeat.structuredContent).revision).toBe(
+      convertedReportRevision,
+    );
+  });
+  it('shares one conversion across calls that differ only in sections, offsets, lengths and revision', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => Response.json(convertedReport()));
+    initRiksdagService({ fetch: network });
+    converter.mockClear();
+    assertSuccess(
+      await runToolContract(riksdagGetDocument, { documentId: 'HC01KU1', sections: [] }),
+    );
+    expect(converter).toHaveBeenCalledTimes(4);
+    const variants: Omit<z.input<typeof riksdagGetDocument.input>, 'documentId'>[] = [
+      { sections: ['references'] },
+      { sections: ['text'], textOffset: 3, textLength: 7 },
+      { sections: ['source_html'], htmlOffset: 10, htmlLength: 4 },
+      { sections: ['decisions', 'properties'], sectionOffset: 1, sectionLimit: 1 },
+      { revision: convertedReportRevision },
+      {},
+    ];
+    for (const args of variants) {
+      const result = await runToolContract(riksdagGetDocument, { documentId: 'hc01ku1', ...args });
+      assertSuccess(result);
+      const page = riksdagGetDocument.output.parse(result.structuredContent);
+      expect(page.revision).toBe(convertedReportRevision);
+      expect(page.outline?.find((entry) => entry.section === 'text')).toEqual({
+        section: 'text',
+        available: true,
+        textLength: 43,
+      });
+    }
+    expect(converter).toHaveBeenCalledTimes(4);
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+});
+/** A full-text result row as the source publishes it, `database` included. */
+function fullTextRow(index: number, database: 'dokument' | 'alla' = 'dokument') {
+  return {
+    database,
+    dok_id: `HD02${index}`,
+    doktyp: 'mot',
+    rm: '2025/26',
+    beteckning: String(index),
+    titel: `Syntetisk motion ${index} om klimat`,
+    undertitel: 'av Syntetisk Ledamot (S)',
+    datum: '2025-10-06',
+    dokument_url_html: `//data.riksdagen.se/dokument/HD02${index}.html`,
+  };
+}
+/** A synthetic member-profile row: the source mixes these into full-text results without a document identity. */
+function memberProfileRow(index: number) {
+  return {
+    database: 'ledamot',
+    id: `00000000-0000-4000-8000-00000000000${index}`,
+    dok_id: '',
+    doktyp: '',
+    typ: '',
+    rm: '',
+    organ: '',
+    beteckning: '',
+    titel: `Syntetisk Ledamot ${index}  (L)`,
+    status: 'Riksdagsledamot',
+    tilltalsnamn: 'Syntetisk',
+    efternamn: `Ledamot ${index}`,
+    parti: 'L',
+  };
+}
+function fullTextPage(rows: unknown[], page = 1) {
+  return {
+    dokumentlista: {
+      '@traffar': '22581',
+      '@sida': String(page),
+      '@nasta_sida': `http://data.riksdagen.se/dokumentlista/?sz=10&p=${page + 1}&utformat=json&sok=klimat&sort=rel&sortorder=desc`,
+      dokument: rows,
+    },
+  };
+}
+describe('member-profile rows in full-text search', () => {
+  it('characterizes a full-text page without member-profile rows', async () => {
+    initRiksdagService({
+      fetch: async () =>
+        Response.json(
+          fullTextPage(
+            Array.from({ length: 10 }, (_, i) => fullTextRow(i + 1, i === 4 ? 'alla' : 'dokument')),
+          ),
+        ),
+    });
+    const result = await runToolContract(riksdagSearchDocuments, { query: 'klimat' });
+    const enrichment = assertSuccess(result);
+    const page = riksdagSearchDocuments.output.parse(result.structuredContent);
+    expect(domainText(result)).toEqual(page);
+    expect(enrichment.notices).toEqual([]);
+    expect(page).toEqual({
+      items: Array.from({ length: 10 }, (_, i) => ({
+        documentId: `HD02${i + 1}`,
+        documentType: 'mot',
+        session: '2025/26',
+        designation: String(i + 1),
+        title: `Syntetisk motion ${i + 1} om klimat`,
+        subtitle: 'av Syntetisk Ledamot (S)',
+        date: '2025-10-06',
+        sourceUrl: `https://data.riksdagen.se/dokument/HD02${i + 1}.html`,
+        statusUrl: `https://data.riksdagen.se/dokumentstatus/HD02${i + 1}.json`,
+      })),
+      page: 1,
+      pageSize: 10,
+      returnedCount: 10,
+      offset: 0,
+      remoteReturnedCount: 10,
+      revision: '5e86617ff50ea0e32ff26b42472e7917d5f367e1962ee243c351fbe0441f7913',
+      totalCount: 22581,
+      hasMore: true,
+      nextCall: {
+        toolName: 'riksdag_search_documents',
+        args: { query: 'klimat', sort: 'relevance', page: 2, pageSize: 10, offset: 0 },
+      },
+    });
+  });
+  it('skips member-profile rows with a counting notice on both surfaces and offsets over documents', async () => {
+    const rows = [
+      ...[1, 2, 3, 4, 5].map((i) => fullTextRow(i)),
+      memberProfileRow(1),
+      memberProfileRow(2),
+      ...[6, 7, 8].map((i) => fullTextRow(i)),
+    ];
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => Response.json(fullTextPage(rows)));
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagSearchDocuments, { query: 'klimat' });
+    const enrichment = assertSuccess(result);
+    const page = riksdagSearchDocuments.output.parse(result.structuredContent);
+    expect(domainText(result)).toEqual(page);
+    const notice =
+      'Skipped 2 member-profile rows the source returned among these documents; offset indexes documents only, and totalCount still counts the skipped rows. Find members with riksdag_search_members.';
+    expect(enrichment.notices).toEqual([notice]);
+    expect(page).toMatchObject({
+      returnedCount: 8,
+      remoteReturnedCount: 8,
+      totalCount: 22581,
+      hasMore: true,
+      nextCall: { args: { page: 2, pageSize: 10, offset: 0 } },
+    });
+    expect(page.items.map((row) => row.documentId)).toEqual(
+      [1, 2, 3, 4, 5, 6, 7, 8].map((i) => `HD02${i}`),
+    );
+    const continued = await runToolContract(riksdagSearchDocuments, {
+      query: 'klimat',
+      offset: 6,
+      revision: page.revision,
+    });
+    expect(assertSuccess(continued).notices).toEqual([notice]);
+    expect(riksdagSearchDocuments.output.parse(continued.structuredContent)).toMatchObject({
+      offset: 6,
+      returnedCount: 2,
+      remoteReturnedCount: 8,
+      revision: page.revision,
+      items: [{ documentId: 'HD027' }, { documentId: 'HD028' }],
+    });
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+  it('names a single skipped member-profile row in the singular', async () => {
+    initRiksdagService({
+      fetch: async () =>
+        Response.json({ dokumentlista: { '@traffar': '1', dokument: memberProfileRow(1) } }),
+    });
+    const result = await runToolContract(riksdagSearchDocuments, { query: 'klimat' });
+    expect(assertSuccess(result).notices).toEqual([
+      'Skipped 1 member-profile row the source returned among these documents; offset indexes documents only, and totalCount still counts the skipped rows. Find members with riksdag_search_members.',
+    ]);
+    expect(riksdagSearchDocuments.output.parse(result.structuredContent)).toMatchObject({
+      items: [],
+      totalCount: 1,
+      hasMore: false,
+    });
+  });
+  it('continues past a page holding only member-profile rows without claiming no matches', async () => {
+    initRiksdagService({
+      fetch: async () => Response.json(fullTextPage([memberProfileRow(1), memberProfileRow(2)], 3)),
+    });
+    const result = await runToolContract(riksdagSearchDocuments, {
+      query: 'klimat',
+      page: 3,
+      pageSize: 2,
+    });
+    const enrichment = assertSuccess(result);
+    const page = riksdagSearchDocuments.output.parse(result.structuredContent);
+    expect(domainText(result)).toEqual(page);
+    expect(enrichment.notices).toEqual([
+      'Skipped 2 member-profile rows the source returned among these documents; offset indexes documents only, and totalCount still counts the skipped rows. Find members with riksdag_search_members.',
+    ]);
+    expect(page).toMatchObject({
+      items: [],
+      returnedCount: 0,
+      remoteReturnedCount: 0,
+      hasMore: true,
+      nextCall: { args: { page: 4, pageSize: 2, offset: 0 } },
+    });
+  });
+  it('gives a page with a skipped member-profile row the revision of its document rows alone', async () => {
+    const documents = [1, 2, 3].map((i) => fullTextRow(i));
+    const revisions = [];
+    // No published hit count: it would count the profile row and so differ between the two pages.
+    for (const rows of [[documents[0], memberProfileRow(1), ...documents.slice(1)], documents]) {
+      initRiksdagService({
+        fetch: async () => Response.json({ dokumentlista: { dokument: rows } }),
+      });
+      const result = await runToolContract(riksdagSearchDocuments, { query: 'klimat' });
+      const page = riksdagSearchDocuments.output.parse(result.structuredContent);
+      expect(page.remoteReturnedCount).toBe(3);
+      revisions.push(page.revision);
+    }
+    expect(revisions[0]).toBe(revisions[1]);
+  });
+});
+describe('calendar and web-page rows in listings', () => {
+  const record = (id: string, traff: number) => ({
+    database: 'dokument',
+    dok_id: id,
+    doktyp: 'utskottsmöte',
+    rm: '2025/26',
+    beteckning: id.slice(4),
+    titel: 'Utrikesutskottets sammanträde',
+    datum: '2026-10-20 11:00:00',
+    traff: String(traff),
+  });
+  const calendar = (id: string, traff: number, datum: string) => ({
+    database: 'kalender',
+    dok_id: id,
+    doktyp: 'kal-vi',
+    rm: '2025/26',
+    titel: 'Visning av konsten i Riksdagshuset',
+    datum,
+    traff: String(traff),
+  });
+  const webPage = (traff: number) => ({
+    database: 'episerver',
+    dok_id: `515a17de-c53e-4f2f-9372-077d1e6b3e7${traff}`,
+    doktyp: '',
+    titel: 'Nu räknas rösterna',
+    traff: String(traff),
+  });
+  const cancelled = (traff: number) => ({
+    database: 'kalender',
+    dok_id: '',
+    id: 'rd',
+    doktyp: 'kam-ip',
+    rm: '2025/26',
+    titel: 'INSTÄLLT - Interpellationsdebatt',
+    traff: String(traff),
+  });
+  it.each([1, 2])(
+    'names %i skipped, listed and merged rows of each kind on both surfaces',
+    async (n) => {
+      const rows = [
+        record('HDA3UU1', 1),
+        ...Array.from({ length: n }, (_, i) => webPage(2 + i)),
+        ...Array.from({ length: n }, (_, i) =>
+          calendar(`HEC42026110${2 + i}vi1-u2634${i}`, 4 + i, '2026-12-14'),
+        ),
+        ...Array.from({ length: n + 1 }, (_, i) =>
+          calendar('HDC420260425vi4', 6, `2026-04-2${5 + i}`),
+        ),
+        { ...memberProfileRow(1), traff: '7' },
+        ...(n === 2 ? [{ ...memberProfileRow(2), traff: '8' }] : []),
+        ...Array.from({ length: n }, (_, i) => cancelled(9 + i)),
+      ];
+      initRiksdagService({
+        fetch: async () =>
+          Response.json({ dokumentlista: { '@traffar': String(2 + 4 * n), dokument: rows } }),
+      });
+      const result = await runToolContract(riksdagSearchDocuments, { session: '2025/26' });
+      const enrichment = assertSuccess(result);
+      const page = riksdagSearchDocuments.output.parse(result.structuredContent);
+      expect(domainText(result)).toEqual(page);
+      const rowWord = n === 1 ? 'row' : 'rows';
+      expect(enrichment.notices).toEqual([
+        `Skipped ${n} member-profile ${rowWord} the source returned among these documents; offset indexes documents only, and totalCount still counts the skipped rows. Find members with riksdag_search_members.`,
+        `Skipped ${n} web-page ${rowWord} the source returned among these documents; offset indexes documents only, and totalCount still counts the skipped rows.`,
+        `Skipped ${n} calendar ${rowWord} with no record ID (such as cancelled entries) the source returned among these documents; offset indexes documents only, and totalCount still counts the skipped rows.`,
+        `Listed ${n} calendar ${rowWord} for single event occurrences (IDs ending in -u and a number) under their event's record ID, which riksdag_get_document reads; each record keeps the date of its first listed row.`,
+        `Merged ${n} repeated ${rowWord} into the records they repeat: the source lists a recurring event once per occurrence date and some records again as calendar entries. Each record appears once, at its first position, and offset indexes the records returned.`,
+      ]);
+      const occurrences = Array.from({ length: n }, (_, i) => `HEC42026110${2 + i}VI1`);
+      expect(page.items.map((item) => item.documentId)).toEqual([
+        'HDA3UU1',
+        ...occurrences,
+        'HDC420260425VI4',
+      ]);
+      expect(page).toMatchObject({
+        returnedCount: 2 + n,
+        remoteReturnedCount: 2 + n,
+        hasMore: false,
+      });
+    },
+  );
+});
 describe('SFS N-series identifiers', () => {
   const nSeries = {
     dok_id: 'sfs-N2026-7',
@@ -1206,6 +1588,116 @@ describe('caller limits are the only page boundaries', () => {
     expect(third.items.at(-1)?.documentId).toBe('HC02120');
     expect(third.nextCall).toBeUndefined();
   });
+  /** Serves `motionSearch` the way the source pages: any `sz` above 200 returns 200 rows. */
+  function motionSource(total: number, requests: URL[] = []): typeof fetch {
+    return async (request) => {
+      const url = new URL(String(request));
+      requests.push(url);
+      return Response.json(
+        motionSearch(
+          Number(url.searchParams.get('p')),
+          total,
+          Math.min(Number(url.searchParams.get('sz')), 200),
+        ),
+      );
+    };
+  }
+  it.each([
+    { requested: 51, applied: 51 },
+    { requested: 137, applied: 137 },
+    { requested: 200, applied: 200 },
+    { requested: 201, applied: 200 },
+  ])('applies pageSize $requested as $applied source rows', async ({ requested, applied }) => {
+    const requests: URL[] = [];
+    initRiksdagService({ fetch: motionSource(905, requests) });
+    const result = await runToolContract(riksdagSearchDocuments, {
+      documentType: 'mot',
+      session: '2024/25',
+      pageSize: requested,
+    });
+    const enrichment = assertSuccess(result);
+    const page = riksdagSearchDocuments.output.parse(result.structuredContent);
+    expect(domainText(result)).toEqual(page);
+    expect(requests.map((url) => url.searchParams.get('sz'))).toEqual([String(applied)]);
+    expect(page).toMatchObject({
+      pageSize: applied,
+      returnedCount: applied,
+      remoteReturnedCount: applied,
+      totalCount: 905,
+      hasMore: true,
+      nextCall: { args: { page: 2, pageSize: applied, offset: 0 } },
+    });
+    expect(enrichment.notices.filter((notice) => notice.includes('clamped'))).toEqual(
+      requested > 200 ? ['Requested pageSize was clamped to 200.'] : [],
+    );
+  });
+  it('returns every hit once in ceil(totalCount / 200) calls at the 200-row ceiling', async () => {
+    const requests: URL[] = [];
+    initRiksdagService({ fetch: motionSource(905, requests) });
+    let result = await runToolContract(riksdagSearchDocuments, {
+      documentType: 'mot',
+      session: '2024/25',
+      pageSize: 200,
+    });
+    const ids: string[] = [];
+    for (let call = 1; ; call++) {
+      assertSuccess(result);
+      const page = riksdagSearchDocuments.output.parse(result.structuredContent);
+      expect(domainText(result)).toEqual(page);
+      ids.push(...page.items.map((row) => row.documentId));
+      if (!page.nextCall) {
+        expect(call).toBe(5);
+        break;
+      }
+      expect(page.nextCall.args).toMatchObject({ page: call + 1, pageSize: 200, offset: 0 });
+      result = await followCall(riksdagSearchDocuments, page.nextCall);
+    }
+    expect(ids).toEqual(Array.from({ length: 905 }, (_, i) => `HC02${i + 1}`));
+    expect(requests.map((url) => url.searchParams.get('sz'))).toEqual(Array(5).fill('200'));
+  });
+  it('resolves an in-page offset with its revision on a 200-row page and rejects a changed page', async () => {
+    let title = 'Ett';
+    const network = vi.fn<typeof fetch>().mockImplementation(async (request) => {
+      const body = motionSearch(Number(new URL(String(request)).searchParams.get('p')), 905, 200);
+      body.dokumentlista.dokument[0]!.titel = title;
+      return Response.json(body);
+    });
+    initRiksdagService({ fetch: network });
+    const filters = { documentType: 'mot', session: '2024/25', pageSize: 200 };
+    const first = riksdagSearchDocuments.output.parse(
+      (await runToolContract(riksdagSearchDocuments, filters)).structuredContent,
+    );
+    const continued = await runToolContract(riksdagSearchDocuments, {
+      ...filters,
+      offset: 150,
+      revision: first.revision,
+    });
+    assertSuccess(continued);
+    const page = riksdagSearchDocuments.output.parse(continued.structuredContent);
+    expect(domainText(continued)).toEqual(page);
+    expect(page).toMatchObject({
+      offset: 150,
+      returnedCount: 50,
+      remoteReturnedCount: 200,
+      revision: first.revision,
+      nextCall: { args: { page: 2, pageSize: 200, offset: 0 } },
+    });
+    expect(page.items).toEqual(first.items.slice(150));
+    expect(network).toHaveBeenCalledTimes(1);
+    title = 'Ändrad';
+    initRiksdagService({ fetch: network });
+    const changed = await runToolContract(riksdagSearchDocuments, {
+      ...filters,
+      offset: 150,
+      revision: first.revision,
+    });
+    expect(changed).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: { code: JsonRpcErrorCode.Conflict, data: { reason: 'revision_changed' } },
+      },
+    });
+  });
   it('returns every selected section of a heavy report complete with no shortening notices', async () => {
     const fixture = reportFixture(3);
     for (const decision of fixture.dokumentstatus.dokutskottsforslag.utskottsforslag)
@@ -1328,4 +1820,201 @@ describe('caller limits are the only page boundaries', () => {
       },
     });
   });
+});
+
+describe("the source's 10,000-row search window", () => {
+  /**
+   * Serves `motionSearch` the way the list route pages: a page ending past row 10,000 is an HTTP
+   * 400, and the next-page link is published while hits remain, even when it points past the window.
+   */
+  function windowSource(total: number, requests: URL[] = []): typeof fetch {
+    return async (request) => {
+      const url = new URL(String(request));
+      requests.push(url);
+      const page = Number(url.searchParams.get('p'));
+      const size = Number(url.searchParams.get('sz'));
+      if (page * size > 10_000)
+        return new Response('Bad Request', {
+          status: 400,
+          headers: { 'content-type': 'text/html' },
+        });
+      const body = motionSearch(page, total, size);
+      return Response.json(
+        page * size < total
+          ? {
+              dokumentlista: {
+                ...body.dokumentlista,
+                '@nasta_sida': `http://data.riksdagen.se/dokumentlista/?sz=${size}&p=${page + 1}&utformat=json`,
+              },
+            }
+          : body,
+      );
+    };
+  }
+  const filters = { documentType: 'mot', session: '2024/25' };
+  const windowEnd =
+    'This page ends at row 10,000, the last row the source serves for one search, and more rows match. Narrow with session, documentType or dateFrom and dateTo to reach them, then start again at page 1.';
+  const pastWindow =
+    'This page starts after row 10,000, the last row the source serves for one search, so no request was made. Page 1 shows how many rows match; when more than 10,000 do, narrow with session, documentType or dateFrom and dateTo.';
+  const remotePages = (requests: URL[]) =>
+    requests.map((url) => [url.searchParams.get('p'), url.searchParams.get('sz')]);
+  const motionIds = (first: number, last: number) =>
+    Array.from({ length: last - first + 1 }, (_, i) => `HC02${first + i}`);
+
+  it.each([
+    { pageSize: 200, page: 51 },
+    { pageSize: 50, page: 201 },
+    { pageSize: 30, page: 335 },
+    { pageSize: 1, page: 10_001 },
+  ])(
+    'answers page $page at pageSize $pageSize, past the window, empty without a request',
+    async ({ pageSize, page }) => {
+      const network = vi.fn<typeof fetch>().mockImplementation(windowSource(12_345));
+      initRiksdagService({ fetch: network });
+      const result = await runToolContract(riksdagSearchDocuments, { ...filters, pageSize, page });
+      const enrichment = assertSuccess(result);
+      const out = riksdagSearchDocuments.output.parse(result.structuredContent);
+      expect(domainText(result)).toEqual(out);
+      expect(network).not.toHaveBeenCalled();
+      expect(enrichment.notices).toEqual([pastWindow]);
+      expect(out).toMatchObject({
+        items: [],
+        page,
+        pageSize,
+        returnedCount: 0,
+        remoteReturnedCount: 0,
+        hasMore: false,
+      });
+      expect(out).not.toHaveProperty('totalCount');
+      expect(out.nextCall).toBeUndefined();
+    },
+  );
+  it('stops at the page ending on row 10,000 while more rows match', async () => {
+    const requests: URL[] = [];
+    initRiksdagService({ fetch: windowSource(12_345, requests) });
+    const result = await runToolContract(riksdagSearchDocuments, {
+      ...filters,
+      pageSize: 200,
+      page: 50,
+    });
+    const enrichment = assertSuccess(result);
+    const out = riksdagSearchDocuments.output.parse(result.structuredContent);
+    expect(domainText(result)).toEqual(out);
+    expect(enrichment.notices).toEqual([windowEnd]);
+    expect(out).toMatchObject({
+      page: 50,
+      pageSize: 200,
+      returnedCount: 200,
+      totalCount: 12_345,
+      hasMore: false,
+    });
+    expect(out.items.map((row) => row.documentId)).toEqual(motionIds(9801, 10_000));
+    expect(out.nextCall).toBeUndefined();
+    expect(remotePages(requests)).toEqual([['50', '200']]);
+  });
+  it.each([
+    { pageSize: 30, page: 334, remote: ['1000', '10'], first: 9991 },
+    { pageSize: 60, page: 167, remote: ['250', '40'], first: 9961 },
+    { pageSize: 7, page: 1429, remote: ['2500', '4'], first: 9997 },
+    { pageSize: 193, page: 52, remote: ['50', '200'], first: 9844 },
+  ])(
+    'reads page $page at pageSize $pageSize, straddling row 10,000, through the page ending there',
+    async ({ pageSize, page, remote, first }) => {
+      const requests: URL[] = [];
+      initRiksdagService({ fetch: windowSource(12_345, requests) });
+      const result = await runToolContract(riksdagSearchDocuments, { ...filters, pageSize, page });
+      const enrichment = assertSuccess(result);
+      const out = riksdagSearchDocuments.output.parse(result.structuredContent);
+      expect(domainText(result)).toEqual(out);
+      expect(remotePages(requests)).toEqual([remote]);
+      expect(enrichment.notices).toEqual([windowEnd]);
+      expect(out.items.map((row) => row.documentId)).toEqual(motionIds(first, 10_000));
+      expect(out).toMatchObject({
+        page,
+        pageSize,
+        returnedCount: 10_001 - first,
+        remoteReturnedCount: 10_001 - first,
+        totalCount: 12_345,
+        hasMore: false,
+      });
+      expect(out.nextCall).toBeUndefined();
+    },
+  );
+  it('follows nextCall onto the straddling page and no further', async () => {
+    const requests: URL[] = [];
+    initRiksdagService({ fetch: windowSource(12_345, requests) });
+    const first = riksdagSearchDocuments.output.parse(
+      (await runToolContract(riksdagSearchDocuments, { ...filters, pageSize: 30, page: 333 }))
+        .structuredContent,
+    );
+    expect(first).toMatchObject({ returnedCount: 30, hasMore: true });
+    expect(first.nextCall?.args).toMatchObject({ page: 334, pageSize: 30, offset: 0 });
+    const last = await followCall(riksdagSearchDocuments, first.nextCall);
+    const out = riksdagSearchDocuments.output.parse(last.structuredContent);
+    expect(out.items.map((row) => row.documentId)).toEqual(motionIds(9991, 10_000));
+    expect(out).toMatchObject({ page: 334, hasMore: false });
+    expect(out.nextCall).toBeUndefined();
+    expect(remotePages(requests)).toEqual([
+      ['333', '30'],
+      ['1000', '10'],
+    ]);
+  });
+  it('walks onto the straddling page without repeating or losing a hit when pages list hits out of order', async () => {
+    /**
+     * The source numbers each hit with its row in the whole result (`traff`) and lists some pages by
+     * ascending date, so a page's highest-numbered hits can come first.
+     */
+    const source = windowSource(12_345);
+    const requests: URL[] = [];
+    initRiksdagService({
+      fetch: async (request) => {
+        requests.push(new URL(String(request)));
+        const response = await source(request);
+        if (!response.ok) return response;
+        const body = (await response.json()) as ReturnType<typeof motionSearch>;
+        const page = Number(body.dokumentlista['@sida']);
+        const size = Number(new URL(String(request)).searchParams.get('sz'));
+        const numbered = body.dokumentlista.dokument.map((row, i) => ({
+          ...row,
+          traff: String((page - 1) * size + i + 1),
+        }));
+        return Response.json({
+          dokumentlista: { ...body.dokumentlista, dokument: numbered.reverse() },
+        });
+      },
+    });
+    const first = riksdagSearchDocuments.output.parse(
+      (await runToolContract(riksdagSearchDocuments, { ...filters, pageSize: 193, page: 51 }))
+        .structuredContent,
+    );
+    const last = riksdagSearchDocuments.output.parse(
+      (await followCall(riksdagSearchDocuments, first.nextCall)).structuredContent,
+    );
+    expect(remotePages(requests)).toEqual([
+      ['51', '193'],
+      ['50', '200'],
+    ]);
+    const ids = (page: typeof first) => page.items.map((row) => row.documentId);
+    expect(ids(last).toSorted()).toEqual(motionIds(9844, 10_000).toSorted());
+    expect([...ids(first), ...ids(last)].toSorted()).toEqual(motionIds(9651, 10_000).toSorted());
+    expect(last).toMatchObject({ page: 52, returnedCount: 157, hasMore: false });
+  });
+  it.each([
+    { total: 10_000, pageSize: 200, page: 50, remote: ['50', '200'], first: 9801, last: 10_000 },
+    { total: 9995, pageSize: 30, page: 334, remote: ['1000', '10'], first: 9991, last: 9995 },
+  ])(
+    'adds no window notice when the $total hits end inside the window',
+    async ({ total, pageSize, page, remote, first, last }) => {
+      const requests: URL[] = [];
+      initRiksdagService({ fetch: windowSource(total, requests) });
+      const result = await runToolContract(riksdagSearchDocuments, { ...filters, pageSize, page });
+      const enrichment = assertSuccess(result);
+      const out = riksdagSearchDocuments.output.parse(result.structuredContent);
+      expect(enrichment.notices).toEqual([]);
+      expect(remotePages(requests)).toEqual([remote]);
+      expect(out.items.map((row) => row.documentId)).toEqual(motionIds(first, last));
+      expect(out).toMatchObject({ totalCount: total, hasMore: false });
+      expect(out.nextCall).toBeUndefined();
+    },
+  );
 });

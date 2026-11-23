@@ -85,3 +85,20 @@ export function reportFixture(count = 3) {
     },
   };
 }
+
+/** A report whose body, two decision proposals and one notice property all convert from HTML. */
+export function convertedReport(documentId = 'HC01KU1', body?: string) {
+  const fixture = reportFixture(2);
+  fixture.dokumentstatus.dokument.dok_id = documentId;
+  if (body !== undefined) fixture.dokumentstatus.dokument.html = body;
+  fixture.dokumentstatus.dokuppgift.uppgift.push({
+    kod: 'notis',
+    namn: 'Notis',
+    text: '<p><b>Kort</b> notis med <a href="/dokument/HC01KU1">länk</a></p>',
+  });
+  return fixture;
+}
+
+/** The record revision of `convertedReport()`, recorded before its conversions were memoized. */
+export const convertedReportRevision =
+  'b4bf9f656013410872f1072fe7ed4f2bd9f904c4395d2a4d47cab99f2de86a64';

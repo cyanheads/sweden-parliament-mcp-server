@@ -22,6 +22,8 @@ import {
 const s = optionalWireString;
 const wireDocument = z.object({
   dok_id: z.string().min(1),
+  database: s,
+  traff: s,
   doktyp: s,
   typ: s,
   subtyp: s,
@@ -41,6 +43,17 @@ const wireDocument = z.object({
   html: s,
   text: s,
 });
+/**
+ * A row the source mixes into search results that carries no parliamentary record: a member profile
+ * (empty `dok_id`), a web page (a bare UUID), or a calendar entry with an empty `dok_id`, such as a
+ * cancelled one. Any other row without a document ID still fails the wire contract.
+ */
+const wireNonRecord = z.union([
+  z.object({ database: z.enum(['ledamot', 'episerver']), traff: s }),
+  z
+    .object({ database: z.literal('kalender'), dok_id: z.literal(''), traff: s })
+    .transform(({ database, traff }) => ({ database, traff })),
+]);
 const listSchema = z.object({
   dokumentlista: z.object({
     '@traffar': wireCount.optional(),
@@ -48,9 +61,15 @@ const listSchema = z.object({
     '@nasta_sida': s,
     '@q': s,
     '@varning': s,
-    dokument: collectionOf(wireDocument),
+    dokument: collectionOf(z.union([wireNonRecord, wireDocument])),
   }),
 });
+type WireDocument = z.infer<typeof wireDocument>;
+type ListRow = ListRoot['dokument'][number];
+/** Document rows in source order; the source's raw row count still includes rows without a record. */
+function documentRows(rows: ListRow[]): WireDocument[] {
+  return rows.filter((row): row is WireDocument => 'dok_id' in row);
+}
 const summaryCell = z.union([z.string(), z.object({ '#text': z.string().nullish() })]);
 const summaryRow = z.object({ th: s, td: collectionOf(summaryCell) });
 const directSummaryRow = z.object({
@@ -431,13 +450,111 @@ function assertNextPage(href: string, expectedPage: number, label: string): void
   )
     throw schemaInvalid(`Invalid ${label} identity.`);
 }
-function validateSearch(root: ListRoot, input: DocumentSearchFilters): void {
-  if (root['@sida'] !== undefined && root['@sida'] !== input.page) identityFailure();
-  const ids = new Set<string>();
-  for (const row of root.dokument) {
+/** Source rows of a search page that are not a record's own row, by kind. */
+type SearchRowCounts = {
+  skippedMemberRows: number;
+  skippedWebPageRows: number;
+  skippedCalendarRows: number;
+  occurrenceRows: number;
+  mergedRows: number;
+};
+const OCCURRENCE_SUFFIX = /-u\d+$/i;
+/** A calendar row for one occurrence of an event: the event's record ID plus `-u` and a number. */
+const isOccurrenceRow = (row: WireDocument) =>
+  row.database === 'kalender' && OCCURRENCE_SUFFIX.test(row.dok_id);
+/** The row under its record's ID; the source serves an occurrence's record under the ID before the suffix. */
+const asRecordRow = (row: WireDocument): WireDocument =>
+  isOccurrenceRow(row) ? { ...row, dok_id: row.dok_id.replace(OCCURRENCE_SUFFIX, '') } : row;
+/**
+ * Source rows grouped by hit, in first-appearance order. The source numbers hits (`traff`) and repeats
+ * a recurring calendar event's row once per occurrence date under one number; a row without a number
+ * is its own hit.
+ */
+function searchHits(rows: ListRow[]): ListRow[][] {
+  const hits: ListRow[][] = [];
+  const numbered = new Map<string, ListRow[]>();
+  for (const row of rows) {
+    const hit = row.traff === undefined ? undefined : numbered.get(row.traff);
+    if (hit) {
+      hit.push(row);
+      continue;
+    }
+    const created = [row];
+    hits.push(created);
+    if (row.traff !== undefined) numbered.set(row.traff, created);
+  }
+  for (const hit of hits) {
+    const [first] = hit;
+    if (
+      hit.length > 1 &&
+      !(
+        first &&
+        'dok_id' in first &&
+        hit.every(
+          (row) => 'dok_id' in row && row.database === 'kalender' && row.dok_id === first.dok_id,
+        )
+      )
+    )
+      throw schemaInvalid('Document search rows of one hit contradict each other.');
+  }
+  return hits;
+}
+/**
+ * Hits folded into records in first-appearance order; rows without a record are counted, not returned.
+ * A record repeats only through calendar rows (further occurrence dates, or a calendar entry beside the
+ * record's own row, whose metadata wins); two non-calendar rows of one ID still contradict.
+ */
+function searchRecords(hits: ListRow[][]): SearchRowCounts & { records: WireDocument[] } {
+  const counts = {
+    skippedMemberRows: 0,
+    skippedWebPageRows: 0,
+    skippedCalendarRows: 0,
+    occurrenceRows: 0,
+    mergedRows: 0,
+  };
+  const records = new Map<string, WireDocument>();
+  for (const listed of hits.flat()) {
+    if (!('dok_id' in listed)) {
+      if (listed.database === 'ledamot') counts.skippedMemberRows++;
+      else if (listed.database === 'episerver') counts.skippedWebPageRows++;
+      else counts.skippedCalendarRows++;
+      continue;
+    }
+    if (isOccurrenceRow(listed)) counts.occurrenceRows++;
+    const row = asRecordRow(listed);
     const id = sourceDocumentId(row.dok_id);
-    if (ids.has(id)) throw schemaInvalid('Document search returned duplicate document IDs.');
-    ids.add(id);
+    const kept = records.get(id);
+    if (!kept) {
+      records.set(id, row);
+      continue;
+    }
+    if (kept.database !== 'kalender' && row.database !== 'kalender')
+      throw schemaInvalid('Document search returned duplicate document IDs.');
+    // Replacing a Map value keeps the record at its first position.
+    if (kept.database === 'kalender' && row.database !== 'kalender') records.set(id, row);
+    counts.mergedRows++;
+  }
+  return { ...counts, records: [...records.values()] };
+}
+/**
+ * The row a hit holds in the whole result. The source numbers hits that way (`traff`) but lists some
+ * pages by ascending date, out of that order; a hit without a number keeps its position on the page.
+ */
+function hitRow(hit: ListRow[], index: number, input: DocumentSearchFilters): number {
+  const number = hit[0]?.traff;
+  return number !== undefined && /^\d+$/.test(number)
+    ? Number(number)
+    : (input.page - 1) * input.pageSize + index + 1;
+}
+/** Validates a whole remote page and returns the records of its hits after its first `skipHits` rows. */
+function validateSearch(
+  root: ListRoot,
+  input: DocumentSearchFilters,
+  skipHits = 0,
+): SearchRowCounts & { records: WireDocument[] } {
+  if (root['@sida'] !== undefined && root['@sida'] !== input.page) identityFailure();
+  const hits = searchHits(root.dokument);
+  for (const row of documentRows(root.dokument).map(asRecordRow)) {
     const type = row.doktyp ?? row.typ;
     if (input.documentType && type && type.toLowerCase() !== input.documentType.toLowerCase())
       identityFailure();
@@ -453,9 +570,14 @@ function validateSearch(root: ListRoot, input: DocumentSearchFilters): void {
       input.pageSize,
       Math.max(0, root['@traffar'] - (input.page - 1) * input.pageSize),
     );
-    if (root.dokument.length !== expected)
+    if (hits.length !== expected)
       throw schemaInvalid('Document search page length contradicts the published hit count.');
   }
+  // The whole page is folded first, so a duplicate among skipped leading hits still fails.
+  const whole = searchRecords(hits);
+  if (!skipHits) return whole;
+  const firstRow = (input.page - 1) * input.pageSize + skipHits + 1;
+  return searchRecords(hits.filter((hit, i) => hitRow(hit, i, input) >= firstRow));
 }
 function metadata(
   raw: z.infer<typeof wireDocument>,
@@ -516,12 +638,59 @@ function validateStatus(root: StatusRoot, id: string): void {
     if (row.ref_dok_id) sourceDocumentId(row.ref_dok_id);
 }
 
-/** Search one remote page without dropping or reordering any fetched rows. */
+/** The list route serves rows 1–10,000 of a search; a page ending past row 10,000 is an HTTP 400. */
+const SEARCH_ROW_WINDOW = 10_000;
+/**
+ * The remote page holding a caller page. A page ending past the window is read through the
+ * smallest page that ends exactly at row 10,000 and still covers its rows (a divisor of the window,
+ * at most 200 because fewer rows remain than the caller page holds); `skip` counts its rows before
+ * the caller page's first row.
+ */
+function remotePage(page: number, pageSize: number) {
+  if (page * pageSize <= SEARCH_ROW_WINDOW) return { page, pageSize, skip: 0 };
+  const remaining = SEARCH_ROW_WINDOW - (page - 1) * pageSize;
+  let size = remaining;
+  while (SEARCH_ROW_WINDOW % size !== 0) size++;
+  return { page: SEARCH_ROW_WINDOW / size, pageSize: size, skip: size - remaining };
+}
+/** One caller page of document search; `rowWindow` marks a page at or past the source's last row. */
+export type DocumentSearchPage = {
+  items: z.infer<typeof documentMetadataSchema>[];
+  page: number;
+  pageSize: number;
+  returnedCount: number;
+  totalCount?: number;
+  hasMore: boolean;
+  rowWindow?: 'end' | 'past';
+  retrievedAt: string;
+  upstreamQuery?: string;
+  upstreamWarnings?: string[];
+} & SearchRowCounts;
+
+/** Search one remote page, returning each record once in source order and counting rows that are not one. */
 export async function searchDocuments(
   service: RiksdagService,
   input: DocumentSearchFilters,
   budget: ToolBudget,
-) {
+): Promise<DocumentSearchPage> {
+  if ((input.page - 1) * input.pageSize >= SEARCH_ROW_WINDOW)
+    return {
+      items: [],
+      page: input.page,
+      pageSize: input.pageSize,
+      returnedCount: 0,
+      hasMore: false,
+      skippedMemberRows: 0,
+      skippedWebPageRows: 0,
+      skippedCalendarRows: 0,
+      occurrenceRows: 0,
+      mergedRows: 0,
+      rowWindow: 'past',
+      // No request is made, so this is the answer time.
+      retrievedAt: new Date().toISOString(),
+    };
+  const remote = remotePage(input.page, input.pageSize);
+  const request = { ...input, page: remote.page, pageSize: remote.pageSize };
   const loaded = await service.loadJson(
     {
       path: '/dokumentlista/',
@@ -539,14 +708,14 @@ export async function searchDocuments(
             ? 'rel'
             : 'datum',
         sortorder: 'desc',
-        p: input.page,
-        sz: input.pageSize,
+        p: request.page,
+        sz: request.pageSize,
         utformat: 'json',
       },
       schema: listSchema,
       ttlMs: 120000,
       cacheable: (data) => {
-        validateSearch(data.dokumentlista, input);
+        validateSearch(data.dokumentlista, request);
         return (
           data.dokumentlista.dokument.length > 0 && data.dokumentlista['@traffar'] !== undefined
         );
@@ -557,12 +726,13 @@ export async function searchDocuments(
   if (!loaded.found)
     throw schemaInvalid('Document search unexpectedly returned a missing response.');
   const root = loaded.data.dokumentlista;
-  validateSearch(root, input);
-  const items = root.dokument.map((row) => metadata(row, 'list'));
+  const { records, ...rowCounts } = validateSearch(root, request, remote.skip);
+  const items = records.map((row) => metadata(row, 'list'));
   const totalCount = root['@traffar'];
-  const hasMore =
-    Boolean(root['@nasta_sida']) ||
-    (totalCount !== undefined && input.page * input.pageSize < totalCount);
+  const lastRow = Math.min(input.page * input.pageSize, SEARCH_ROW_WINDOW);
+  const moreMatch =
+    Boolean(root['@nasta_sida']) || (totalCount !== undefined && lastRow < totalCount);
+  const windowEnd = moreMatch && lastRow === SEARCH_ROW_WINDOW;
   budget.check();
   return {
     items,
@@ -570,21 +740,51 @@ export async function searchDocuments(
     pageSize: input.pageSize,
     returnedCount: items.length,
     ...(totalCount === undefined ? {} : { totalCount }),
-    hasMore,
+    hasMore: moreMatch && !windowEnd,
+    ...rowCounts,
+    ...(windowEnd ? { rowWindow: 'end' as const } : {}),
     retrievedAt: loaded.retrievedAt,
     ...(root['@q'] ? { upstreamQuery: root['@q'] } : {}),
     ...(root['@varning'] ? { upstreamWarnings: [root['@varning']] } : {}),
   };
 }
 
-/** Load and normalize the complete status record; never paginate decisions used by vote workflows. */
+const propertyRows = (root: StatusRoot) =>
+  root.dokuppgift?.uppgift ?? root.dokumentuppgift?.uppgift ?? [];
+const isSfsDocument = (raw: WireDocument) => (raw.doktyp ?? raw.typ)?.toLowerCase() === 'sfs';
+/** Every HTML-to-Markdown conversion of one status record, positionally aligned with its source rows. */
+const conversionsSchema = z.object({
+  text: z.string().optional(),
+  proposals: z.array(z.string().nullable()),
+  notices: z.array(z.string().nullable()),
+});
+/** Derived from the wire alone, so it is memoized beside the cached response it came from. */
+function convertStatus(root: StatusRoot): z.infer<typeof conversionsSchema> {
+  const raw = root.dokument;
+  return {
+    ...(!isSfsDocument(raw) && raw.html ? { text: htmlToMarkdown(raw.html) } : {}),
+    proposals: (root.dokutskottsforslag?.utskottsforslag ?? []).map((x) =>
+      x.forslag === undefined ? null : htmlToMarkdown(x.forslag),
+    ),
+    notices: propertyRows(root).map((x) =>
+      x.text !== undefined && (x.kod === 'notis' || x.kod === 'utsknotis')
+        ? htmlToMarkdown(x.text)
+        : null,
+    ),
+  };
+}
+
+/**
+ * Load and normalize the complete status record; never paginate decisions used by vote workflows.
+ * Its HTML conversions run once per cached response, so a warm call converts nothing.
+ */
 export async function loadDocumentStatus(
   service: RiksdagService,
   documentId: string,
   budget: ToolBudget,
 ): Promise<DocumentStatusResult> {
   const id = normalizeDocumentId(documentId);
-  const loaded = await service.loadJson(
+  const loaded = await service.loadJsonDerived(
     {
       path: `/dokumentstatus/${id}.json`,
       schema: statusSchema,
@@ -596,26 +796,26 @@ export async function loadDocumentStatus(
       },
     },
     budget,
+    (data) => JSON.stringify(convertStatus(data.dokumentstatus)),
   );
   if (!loaded.found) return { found: false, documentId: id, retrievedAt: loaded.retrievedAt };
   const root = loaded.data.dokumentstatus;
   validateStatus(root, id);
+  const converted = conversionsSchema.parse(JSON.parse(loaded.derived));
   const raw = root.dokument;
-  const properties = (root.dokuppgift?.uppgift ?? root.dokumentuppgift?.uppgift ?? []).map((x) => ({
-    code: x.kod,
-    name: x.namn,
-    text:
-      x.text !== undefined && (x.kod === 'notis' || x.kod === 'utsknotis')
-        ? htmlToMarkdown(x.text)
-        : x.text,
-    ...(x.text !== undefined && (x.kod === 'notis' || x.kod === 'utsknotis')
-      ? { sourceHtml: x.text }
-      : {}),
-  }));
-  const decisions = (root.dokutskottsforslag?.utskottsforslag ?? []).map((x) => ({
+  const properties = propertyRows(root).map((x, i) => {
+    const notice = converted.notices[i] ?? undefined;
+    return {
+      code: x.kod,
+      name: x.namn,
+      text: notice ?? x.text,
+      ...(notice === undefined ? {} : { sourceHtml: x.text }),
+    };
+  });
+  const decisions = (root.dokutskottsforslag?.utskottsforslag ?? []).map((x, i) => ({
     point: x.punkt,
     heading: x.rubrik,
-    proposal: x.forslag === undefined ? undefined : htmlToMarkdown(x.forslag),
+    proposal: converted.proposals[i] ?? undefined,
     ...(x.forslag === undefined ? {} : { proposalSourceHtml: x.forslag }),
     decisionType: x.beslutstyp,
     voteId: x.votering_id,
@@ -631,10 +831,8 @@ export async function loadDocumentStatus(
     decisionRuleParagraph: x.beslutsregelparagraf,
     pointType: x.punkttyp,
   }));
-  const isSfs = (raw.doktyp ?? raw.typ)?.toLowerCase() === 'sfs';
-  budget.check();
-  const text = isSfs ? raw.text : raw.html ? htmlToMarkdown(raw.html) : undefined;
-  budget.check();
+  const isSfs = isSfsDocument(raw);
+  const text = isSfs ? raw.text : converted.text;
   const record = {
     metadata: {
       ...metadata(raw),
@@ -725,13 +923,13 @@ export async function resolveReport(
       );
     return loaded;
   };
-  const candidates: z.infer<typeof wireDocument>[] = [];
+  const candidates: WireDocument[] = [];
   let page = 1;
   let loaded = await loadPage(page);
   for (;;) {
     const root = loaded.data.dokumentlista;
     if (root['@sida'] !== undefined && root['@sida'] !== page) identityFailure();
-    for (const row of root.dokument) {
+    for (const row of documentRows(root.dokument)) {
       if (
         !row.rm ||
         sourceSession(row.rm) !== rm ||

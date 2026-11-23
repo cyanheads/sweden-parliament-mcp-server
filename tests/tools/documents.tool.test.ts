@@ -177,4 +177,36 @@ describe('document tool boundaries', () => {
       getRiksdagService().dispose();
     }
   });
+  it('sends a committee code typed without its Swedish letter as the code and names committee when none matches', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => Response.json({ dokumentlista: { '@traffar': '0' } }));
+    initRiksdagService({ fetch: network });
+    try {
+      for (const [committee, org] of [
+        ['fou', 'FöU'],
+        ['UFOU', 'UFöU'],
+      ] as const) {
+        network.mockClear();
+        await riksdagSearchDocuments.handler(
+          riksdagSearchDocuments.input.parse({ documentType: 'bet', committee }),
+          createMockContext({ errors: riksdagSearchDocuments.errors }),
+        );
+        expect(new URL(String(network.mock.calls[0]?.[0])).searchParams.get('org')).toBe(org);
+      }
+      network.mockClear();
+      await expect(
+        riksdagSearchDocuments.handler(
+          riksdagSearchDocuments.input.parse({ committee: 'saru' }),
+          createMockContext({ errors: riksdagSearchDocuments.errors }),
+        ),
+      ).rejects.toMatchObject({
+        message: expect.stringMatching(/^Invalid committee;/),
+        data: { reason: 'invalid_filter', field: 'committee' },
+      });
+      expect(network).not.toHaveBeenCalled();
+    } finally {
+      getRiksdagService().dispose();
+    }
+  });
 });
