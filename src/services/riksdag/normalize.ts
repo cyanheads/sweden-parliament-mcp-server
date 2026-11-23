@@ -82,20 +82,43 @@ function exactKey(value: string): string {
   return value.trim().normalize('NFC').toLocaleLowerCase('sv-SE');
 }
 
+/** Canonical decomposition without combining marks: FöU becomes FoU. */
+function withoutDiacritics(value: string): string {
+  return value.normalize('NFD').replace(/\p{M}/gu, '');
+}
+
+/**
+ * The committee code each ASCII spelling of a Swedish-letter code stands for, keyed like
+ * `exactKey` (fou → FöU, ufou → UFöU). Derived from the bundled table; normalize.test.ts pins that
+ * every spelling is ASCII, unique, and equal to no ASCII code.
+ */
+const COMMITTEE_FOLDS: ReadonlyMap<string, string> = new Map(
+  REFERENCE_TABLES.committees.flatMap((row) => {
+    const ascii = withoutDiacritics(row.code);
+    return ascii === row.code ? [] : [[exactKey(ascii), row.code] as const];
+  }),
+);
+
 function uniqueCode(rows: readonly ReferenceEntry[]): string | undefined {
   const codes = new Set(rows.map((row) => row.code));
   return codes.size === 1 ? [...codes][0] : undefined;
 }
 
-/** Resolve a code or unique exact Swedish/available English label, preserving official code spelling. */
+/**
+ * Resolve a code or unique exact Swedish/available English label, preserving official code
+ * spelling. A committee code typed without its Swedish letter resolves to that code (fou → FöU).
+ * `field` names the caller's input field in the rejection.
+ */
 export function normalizeCode(
   value: string,
   topic: 'document_types' | 'committees' | 'parties' | 'constituencies',
+  field: string = topic,
 ): string {
   const key = exactKey(value);
   const rows = REFERENCE_TABLES[topic];
   return (
     uniqueCode(rows.filter((row) => exactKey(row.code) === key)) ??
+    (topic === 'committees' ? COMMITTEE_FOLDS.get(key) : undefined) ??
     uniqueCode(
       rows.filter(
         (row) =>
@@ -105,7 +128,7 @@ export function normalizeCode(
           ),
       ),
     ) ??
-    invalid(topic)
+    invalid(topic, field)
   );
 }
 
@@ -164,8 +187,8 @@ export function normalizeSpeechId(value: string): string {
   return `${protocolId.toUpperCase()}-${match?.[2]}`;
 }
 
-/** Resolve an NFC report designation, trimming each part, and reject a disagreeing composite session prefix. */
-export function normalizeReport(value: string, session: string): string {
+/** An NFC designation's letter prefix and number, each part trimmed, after the session-prefix check. */
+function reportParts(value: string, session: string): { prefix: string; number: string } {
   const parts = value
     .normalize('NFC')
     .split(':')
@@ -174,9 +197,28 @@ export function normalizeReport(value: string, session: string): string {
   const firstPart = parts[0] ?? invalid('report');
   if (parts.length === 2 && normalizeSession(firstPart) !== normalizeSession(session))
     return invalid('report session');
-  const designation = parts.at(-1) ?? invalid('report');
-  if (!/^[a-zåäö]+[1-9]\d*$/i.test(designation)) return invalid('report');
-  return designation.toUpperCase();
+  const match = /^([a-zåäö]+)([1-9]\d*)$/i.exec(parts.at(-1) ?? '');
+  if (!match) return invalid('report');
+  const [, prefix = '', number = ''] = match;
+  return { prefix, number };
+}
+
+/**
+ * The comparable key of a report designation as written (FöU1 → FÖU1), rejecting a disagreeing
+ * composite session prefix. Source designations compare through this, never folded.
+ */
+export function reportDesignationKey(value: string, session: string): string {
+  const { prefix, number } = reportParts(value, session);
+  return `${prefix.toUpperCase()}${number}`;
+}
+
+/**
+ * {@link reportDesignationKey} for caller input, where a committee prefix typed without its
+ * Swedish letter keys as that committee's designation (fou17 → FÖU17, as föu17 does).
+ */
+export function normalizeReport(value: string, session: string): string {
+  const { prefix, number } = reportParts(value, session);
+  return `${(COMMITTEE_FOLDS.get(exactKey(prefix)) ?? prefix).toUpperCase()}${number}`;
 }
 
 /** Validate an actual Gregorian ISO date without JavaScript date overflow; `field` names the caller's input field in the rejection. */
@@ -212,9 +254,7 @@ export function normalizeDateRange(
 }
 
 function searchable(value: string): string {
-  return value
-    .normalize('NFD')
-    .replace(/\p{M}/gu, '')
+  return withoutDiacritics(value)
     .toLocaleLowerCase('sv-SE')
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim();

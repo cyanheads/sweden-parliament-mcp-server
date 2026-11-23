@@ -13,8 +13,9 @@ import {
   normalizeSpeechId,
   normalizeTokens,
   optionalString,
+  reportDesignationKey,
 } from '@/services/riksdag/normalize.js';
-import { REFERENCE_TABLES } from '@/services/riksdag/reference-data.js';
+import { COMMITTEES, REFERENCE_TABLES } from '@/services/riksdag/reference-data.js';
 
 describe('source identifiers and filters', () => {
   it.each(['sfs-2000-100', 'SFS 2000:100', '2000:100'])(
@@ -180,6 +181,111 @@ describe('report designation normalization', () => {
       expect(normalizeReport(input, '2024/25')).toBe('FÖU1');
     },
   );
+});
+
+describe('committee codes typed without their Swedish letter', () => {
+  it.each([
+    ['fou17', '2025/26', 'FÖU17'],
+    ['FOU17', '2025/26', 'FÖU17'],
+    ['2025/26:fou17', '2025/26', 'FÖU17'],
+    [' 2025/2026 : Fou17 ', '2025/26', 'FÖU17'],
+    ['ufou1', '2025/26', 'UFÖU1'],
+    ['UFOU1', '2025/26', 'UFÖU1'],
+  ])('keys caller report %j in %s as %s', (input, session, key) => {
+    expect(normalizeReport(input, session)).toBe(key);
+  });
+  it.each(['FöU17', 'föu17', 'FÖU17', 'Föu17', 'FöU17', '2025/26:FöU17', ' FöU17 '])(
+    'keeps the key of %j',
+    (input) => {
+      expect(normalizeReport(input, '2025/26')).toBe('FÖU17');
+    },
+  );
+  it.each([
+    ['saru1', 'SARU1'],
+    ['xyz1', 'XYZ1'],
+    ['KU1', 'KU1'],
+    ['mju2', 'MJU2'],
+  ])('keeps a prefix with no fold %j as %s', (input, key) => {
+    expect(normalizeReport(input, '2025/26')).toBe(key);
+  });
+  it('rejects a disagreeing session prefix before folding', () => {
+    expect(() => normalizeReport('2024/25:fou17', '2025/26')).toThrow('Invalid report session');
+  });
+  it('compares source designations as written', () => {
+    expect(reportDesignationKey('FOU17', '2025/26')).toBe('FOU17');
+    expect(reportDesignationKey('ufou1', '2025/26')).toBe('UFOU1');
+    expect(reportDesignationKey('2025/26:föu17', '2025/26')).toBe('FÖU17');
+    expect(() => reportDesignationKey('2024/25:FöU17', '2025/26')).toThrow(
+      'Invalid report session',
+    );
+  });
+  it.each([
+    ['fou', 'FöU'],
+    ['FOU', 'FöU'],
+    ['Fou', 'FöU'],
+    ['ufou', 'UFöU'],
+    ['UFOU', 'UFöU'],
+    ['FöU', 'FöU'],
+    ['föu', 'FöU'],
+    ['FÖU', 'FöU'],
+    ['Försvarsutskottet', 'FöU'],
+    ['mju', 'MjU'],
+    ['MJU', 'MjU'],
+  ])('resolves committee %j to %s', (input, code) => {
+    expect(normalizeCode(input, 'committees')).toBe(code);
+  });
+  it.each(['saru', 'Säru', 'Forsvarsutskottet', 'fo', 'foux'])(
+    'keeps rejecting committee %j',
+    (input) => {
+      expect(() => normalizeCode(input, 'committees', 'committee')).toThrow('Invalid committee;');
+    },
+  );
+  it('folds only committees', () => {
+    expect(() => normalizeCode('fou', 'parties')).toThrow('Invalid parties');
+  });
+  it('derives every fold from the committee table, unique and distinct from every ASCII code', () => {
+    const ascii = (code: string) => /^[\x20-\x7E]*$/.test(code);
+    const folds = COMMITTEES.filter((row) => !ascii(row.code)).map((row) => ({
+      code: row.code,
+      fold: row.code.normalize('NFD').replace(/\p{M}/gu, '').toUpperCase(),
+    }));
+    expect(folds.length).toBeGreaterThan(0);
+    const asciiCodes = COMMITTEES.filter((row) => ascii(row.code)).map((row) =>
+      row.code.toUpperCase(),
+    );
+    expect(new Set(folds.map(({ fold }) => fold)).size).toBe(folds.length);
+    for (const { code, fold } of folds) {
+      expect(ascii(fold), fold).toBe(true);
+      expect(asciiCodes).not.toContain(fold);
+      expect(normalizeCode(fold, 'committees')).toBe(code);
+      expect(normalizeCode(fold.toLowerCase(), 'committees')).toBe(code);
+      expect(normalizeReport(`${fold.toLowerCase()}3`, '2025/26')).toBe(`${code.toUpperCase()}3`);
+      expect(reportDesignationKey(`${fold}3`, '2025/26')).toBe(`${fold}3`);
+    }
+  });
+});
+
+describe('code rejections name the caller field', () => {
+  it.each([
+    ['committees', 'committee', 'xyz'],
+    ['document_types', 'documentType', 'unknown'],
+    ['parties', 'party', 'unknown'],
+    ['constituencies', 'constituency', 'unknown'],
+  ] as const)('names %s input as %s', (topic, field, value) => {
+    let thrown: unknown;
+    try {
+      normalizeCode(value, topic, field);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({
+      message: `Invalid ${field}; use riksdag_list_reference to check its format or code.`,
+      data: { reason: 'invalid_filter', field },
+    });
+  });
+  it('names the topic when no field is given', () => {
+    expect(() => normalizeCode('xyz', 'committees')).toThrow('Invalid committees;');
+  });
 });
 
 describe('N-series SFS identifiers', () => {

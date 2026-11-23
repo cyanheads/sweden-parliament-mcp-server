@@ -1,6 +1,6 @@
 /** @fileoverview CPU bounds for the raw-input format patterns on caller-sized input. @module tests/services/riksdag/normalize-pattern-timing */
 import { describe, expect, it } from 'vitest';
-import { formatString, type InputFormat } from '@/services/riksdag/normalize.js';
+import { formatString, type InputFormat, normalizeReport } from '@/services/riksdag/normalize.js';
 
 /** Keyed by every `InputFormat`, so a new format fails the typecheck until it is timed here. */
 const FORMATS = Object.keys({
@@ -17,12 +17,15 @@ const SCHEMAS = FORMATS.flatMap((format) =>
   ),
 );
 type Shape = readonly [name: string, make: (size: number) => string];
+const LINE_BREAK_SHAPES: Shape[] = [
+  ['terminal break', (size) => `${'§1 x'.repeat(Math.ceil(size / 4)).slice(0, size)}\ny`],
+  ['interspersed breaks', (size) => '  \r\n'.repeat(Math.ceil(size / 4)).slice(0, size)],
+];
 const SHAPES: Shape[] = [
   ['spaces then x', (size) => `${' '.repeat(size)}x`],
   ['spaces', (size) => ' '.repeat(size)],
   ['tabs then newline', (size) => `${'\t'.repeat(size)}\n`],
-  ['terminal break', (size) => `${'§1 x'.repeat(Math.ceil(size / 4)).slice(0, size)}\ny`],
-  ['interspersed breaks', (size) => '  \r\n'.repeat(Math.ceil(size / 4)).slice(0, size)],
+  ...LINE_BREAK_SHAPES,
 ];
 /** Runs inside each format's body, where its own quantifiers meet the closing whitespace. */
 const BODY_SHAPES: [InputFormat, ...Shape][] = [
@@ -37,6 +40,13 @@ const BODY_SHAPES: [InputFormat, ...Shape][] = [
   ['report', 'designation run', (size) => `F${'ö'.repeat(size)}x`],
   ['report', 'prefix whitespace gap', (size) => `2024/25${' '.repeat(size)}x`],
   ['report', 'post-colon whitespace gap', (size) => `2024/25:${' '.repeat(size)}x`],
+];
+/** Caller designations through the report normalizer, committee-prefix lookup included. */
+const REPORT_SHAPES: Shape[] = [
+  ['ASCII prefix run', (size) => `${'f'.repeat(size)}1`],
+  ['folded prefix number run', (size) => `fou${'1'.repeat(size)}`],
+  ['post-colon whitespace gap', (size) => `2024/25:${' '.repeat(size)}fou1`],
+  ...LINE_BREAK_SHAPES,
 ];
 
 /** Least per-call thread CPU time over several batches; a GC pause only ever adds time. */
@@ -54,12 +64,12 @@ function leastCpuUs(run: () => void, calls: number): number {
 /** Doubles 5k → 320k, checking the absolute and growth bounds at each size before the next. */
 function expectLinear(
   label: string,
-  schema: { safeParse: (value: string) => unknown },
+  run: (value: string) => unknown,
   make: (size: number) => string,
 ) {
   const BASE = 5000;
   const parse = (input: string) => () => {
-    schema.safeParse(input);
+    run(input);
   };
   const baseInput = make(BASE);
   for (let size = BASE * 2; size <= BASE * 64; size *= 2) {
@@ -83,7 +93,7 @@ describe('format pattern CPU growth', () => {
   )(
     'keeps %s linear on %s across a 64x span',
     (label, shape, schema, make) => {
-      expectLinear(`${label} ${shape}`, schema, make);
+      expectLinear(`${label} ${shape}`, (value) => schema.safeParse(value), make);
     },
     0,
   );
@@ -94,7 +104,25 @@ describe('format pattern CPU growth', () => {
   )(
     'keeps %s (blank %s) linear on a %s across a 64x span',
     (format, blank, shape, make) => {
-      expectLinear(`${format} ${shape}`, formatString(format, { blank }), make);
+      const schema = formatString(format, { blank });
+      expectLinear(`${format} ${shape}`, (value) => schema.safeParse(value), make);
+    },
+    0,
+  );
+  it.each(REPORT_SHAPES)(
+    'keeps normalizeReport linear on a %s across a 64x span',
+    (shape, make) => {
+      expectLinear(
+        `normalizeReport ${shape}`,
+        (value) => {
+          try {
+            normalizeReport(value, '2024/25');
+          } catch {
+            // A rejection is a timed outcome like an accepted key.
+          }
+        },
+        make,
+      );
     },
     0,
   );
