@@ -67,6 +67,102 @@ describe('member tool inputs', () => {
       getRiksdagService().dispose();
     }
   });
+  it('keeps committee and familyNamePrefix as optional inputs', () => {
+    expect(
+      riksdagSearchMembers.input.parse({ committee: 'FiU', familyNamePrefix: 'Pal' }),
+    ).toMatchObject({ committee: 'FiU', familyNamePrefix: 'Pal' });
+  });
+  it.each(['unknown', 'S', 'kam', 'Fi', 'NR', 'KD'])(
+    'rejects committee %s as invalid_filter before HTTP',
+    async (committee) => {
+      const network = vi.fn<typeof fetch>();
+      initRiksdagService({ fetch: network });
+      try {
+        const result = await runToolContract(riksdagSearchMembers, { committee });
+        expect(result).toMatchObject({
+          isError: true,
+          structuredContent: {
+            error: {
+              code: JsonRpcErrorCode.ValidationError,
+              data: { reason: 'invalid_filter' },
+            },
+          },
+        });
+        expect(result.content).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: 'text',
+              text: expect.stringContaining('riksdag_list_reference'),
+            }),
+          ]),
+        );
+        expect(network).not.toHaveBeenCalled();
+      } finally {
+        getRiksdagService().dispose();
+      }
+    },
+  );
+  it.each([
+    ['committee', 'XyU'],
+    ['party', 'unknown'],
+    ['constituency', 'unknown'],
+  ])('names the %s field in an unknown-code rejection', async (field, value) => {
+    const network = vi.fn<typeof fetch>();
+    initRiksdagService({ fetch: network });
+    try {
+      const result = await runToolContract(riksdagSearchMembers, { [field]: value });
+      const message = `Invalid ${field}; use riksdag_list_reference to check its format or code.`;
+      expect(result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { message, data: { reason: 'invalid_filter', field } } },
+      });
+      expect(
+        result.content
+          .filter((block) => block.type === 'text')
+          .map((block) => block.text)
+          .join('\n'),
+      ).toContain(message);
+      expect(network).not.toHaveBeenCalled();
+    } finally {
+      getRiksdagService().dispose();
+    }
+  });
+  it.each(['Pal%', '_alme', 'Sydow,B', '%'])(
+    'rejects familyNamePrefix %s as invalid_filter before HTTP',
+    async (familyNamePrefix) => {
+      const network = vi.fn<typeof fetch>();
+      initRiksdagService({ fetch: network });
+      try {
+        const result = await runToolContract(riksdagSearchMembers, {
+          register: 'all',
+          familyNamePrefix,
+        });
+        expect(result).toMatchObject({
+          isError: true,
+          structuredContent: {
+            error: {
+              code: JsonRpcErrorCode.ValidationError,
+              message: 'familyNamePrefix cannot contain %, _ or a comma.',
+              data: {
+                reason: 'invalid_filter',
+                field: 'familyNamePrefix',
+                recovery: { hint: expect.stringContaining('nameContains') },
+              },
+            },
+          },
+        });
+        const text = result.content
+          .filter((block) => block.type === 'text')
+          .map((block) => block.text)
+          .join('\n');
+        expect(text).toContain('familyNamePrefix cannot contain');
+        expect(text).toContain('nameContains');
+        expect(network).not.toHaveBeenCalled();
+      } finally {
+        getRiksdagService().dispose();
+      }
+    },
+  );
   it('rejects a malformed memberId at the schema with the format message on both surfaces', async () => {
     const message = 'Invalid memberId; use riksdag_list_reference to check its format or code.';
     const network = vi.fn<typeof fetch>();

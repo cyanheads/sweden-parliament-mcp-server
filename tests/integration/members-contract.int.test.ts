@@ -8,7 +8,15 @@ import { riksdagSearchMembers } from '@/mcp-server/tools/definitions/search-memb
 import { successEnrichment } from '@/services/riksdag/output.js';
 import { getRiksdagService, initRiksdagService } from '@/services/riksdag/riksdag-service.js';
 import { continuationArgs } from '../services/riksdag/continuation-fixtures.js';
-import { memberDetail, memberRows } from '../services/riksdag/member-fixtures.js';
+import {
+  memberDetail,
+  memberRows,
+  registerPayload,
+  rosterAssignment,
+  rosterRows,
+  rosterRowWithoutCurrentAssignment,
+  SOURCE_TIME,
+} from '../services/riksdag/member-fixtures.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -18,14 +26,11 @@ function assertSuccess(result: Awaited<ReturnType<typeof runToolContract>>) {
   expect(result.isError).not.toBe(true);
   const enrichment = z.object(successEnrichment).parse(result.structuredContent);
   expect(enrichment.source).toBe('Source: The Swedish Parliament');
-  const text = result.content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('\n');
-  expect(text).toContain('Source: The Swedish Parliament');
-  expect(text).toContain(enrichment.retrievedAt);
+  const body = text(result);
+  expect(body).toContain('Source: The Swedish Parliament');
+  expect(body).toContain(enrichment.retrievedAt);
   for (const notice of enrichment.notices)
-    expect(text).toContain(JSON.stringify(notice).slice(1, -1));
+    expect(body).toContain(JSON.stringify(notice).slice(1, -1));
   return enrichment;
 }
 function domainText(result: Awaited<ReturnType<typeof runToolContract>>): unknown {
@@ -37,6 +42,541 @@ function domainText(result: Awaited<ReturnType<typeof runToolContract>>): unknow
     first.text.slice(firstNewline + 1, first.text.indexOf(`\n${delimiter}`, firstNewline)),
   );
 }
+const SERVICE_NOTICE =
+  'Service-register status is not proof of elected membership; minister and unknown labels remain unknown.';
+function rosterItem(
+  iid: string,
+  givenName: string,
+  familyName: string,
+  party: string,
+  constituency: string,
+  status: string,
+  serviceClassification: 'serving' | 'not_serving' | 'unknown',
+) {
+  const sourceRecordId = `00000000-0000-4000-8000-00000000${iid}`;
+  return {
+    memberId: iid,
+    sourceRecordId,
+    detailAvailable: true,
+    name: `${givenName} ${familyName}`,
+    givenName,
+    familyName,
+    party,
+    constituency,
+    status,
+    serviceClassification,
+    sourceUrl: `https://data.riksdagen.se/person/${sourceRecordId}`,
+  };
+}
+const ROSTER_ITEMS = [
+  rosterItem(
+    '0101',
+    'Anna',
+    'Palmén Synthetic',
+    'S',
+    'Stockholms kommun',
+    'Tjänstgörande riksdagsledamot',
+    'serving',
+  ),
+  rosterItem(
+    '0102',
+    'Bertil',
+    'Synthetic',
+    'SD',
+    'Skåne läns västra',
+    'Tjänstgörande riksdagsledamot',
+    'serving',
+  ),
+  rosterItem(
+    '0103',
+    'Cecilia',
+    'von Synthetic',
+    'S',
+    'Stockholms län',
+    'Tjänstgörande ersättare',
+    'serving',
+  ),
+  rosterItem(
+    '0104',
+    'David',
+    'Synthetic',
+    'M',
+    'Stockholms kommun',
+    'Tidigare riksdagsledamot',
+    'not_serving',
+  ),
+];
+const HISTORICAL_UUID = '12345678-1234-4234-8234-123456789abc';
+describe('member calls without committee or familyNamePrefix', () => {
+  it('send the same URLs and return the same rows, counts, notices and revisions', async () => {
+    const historical = {
+      intressent_id: HISTORICAL_UUID,
+      sourceid: HISTORICAL_UUID,
+      tilltalsnamn: 'Olof',
+      efternamn: 'Palme',
+      sorteringsnamn: 'Palme,Olof',
+      status: 'Tidigare riksdagsledamot',
+      person_url_xml: `https://data.riksdagen.se/person/${HISTORICAL_UUID}`,
+      personuppdrag: '',
+    };
+    const network = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+      const query = new URL(String(url)).searchParams;
+      if (query.get('rdlstatus') === 'samtliga')
+        return Response.json(registerPayload([...rosterRows(), historical], 6));
+      const party = query.get('parti');
+      return Response.json(
+        registerPayload(rosterRows().filter((row) => party === null || row.parti === party)),
+      );
+    });
+    initRiksdagService({ fetch: network });
+    const cases = [
+      {
+        args: {},
+        url: 'https://data.riksdagen.se/personlista/?rdlstatus=tjanst&utformat=json',
+        expected: {
+          items: ROSTER_ITEMS,
+          candidateCount: 4,
+          sourceReportedCount: 4,
+          totalCount: 4,
+          returnedCount: 4,
+          offset: 0,
+          limit: 20,
+          requestedLimit: 20,
+          revision: '0fa0847ee0d7764f0b1e08e3e34a8605738da07a7c31bfb06b59ffa0a3f93706',
+          hasMore: false,
+          effectiveQuery: '{"limit":20,"offset":0,"register":"service","sitting":"all"}',
+          source: 'Source: The Swedish Parliament',
+          notices: [SERVICE_NOTICE],
+        },
+      },
+      {
+        args: { party: 'SD' },
+        url: 'https://data.riksdagen.se/personlista/?parti=SD&rdlstatus=tjanst&utformat=json',
+        expected: {
+          items: [ROSTER_ITEMS[1]],
+          candidateCount: 1,
+          sourceReportedCount: 1,
+          totalCount: 1,
+          returnedCount: 1,
+          offset: 0,
+          limit: 20,
+          requestedLimit: 20,
+          revision: '0caefad85fcdca42c4ca98bbcafca2c629de3b2675bbdbd8f84745a97a7d9ce7',
+          hasMore: false,
+          effectiveQuery:
+            '{"limit":20,"offset":0,"party":"SD","register":"service","sitting":"all"}',
+          source: 'Source: The Swedish Parliament',
+          notices: [SERVICE_NOTICE],
+        },
+      },
+      {
+        args: { register: 'all' as const, nameContains: 'Palme' },
+        url: 'https://data.riksdagen.se/personlista/?rdlstatus=samtliga&utformat=json',
+        expected: {
+          items: [
+            ROSTER_ITEMS[0],
+            {
+              sourceRecordId: HISTORICAL_UUID,
+              detailAvailable: false,
+              name: 'Olof Palme',
+              givenName: 'Olof',
+              familyName: 'Palme',
+              status: 'Tidigare riksdagsledamot',
+              serviceClassification: 'not_serving',
+              sourceUrl: `https://data.riksdagen.se/person/${HISTORICAL_UUID}`,
+            },
+          ],
+          candidateCount: 5,
+          sourceReportedCount: 6,
+          totalCount: 2,
+          returnedCount: 2,
+          offset: 0,
+          limit: 20,
+          requestedLimit: 20,
+          revision: 'fe72d65c410fd78ff6b5381e3dad5853712a597f8fef0a42f166392ebb639435',
+          hasMore: false,
+          effectiveQuery:
+            '{"limit":20,"nameContains":"Palme","offset":0,"register":"all","sitting":"all"}',
+          source: 'Source: The Swedish Parliament',
+          notices: [
+            SERVICE_NOTICE,
+            'All-register scope covers returned source records, not an independently verified historical census. Cold requests can reach the normal timeout.',
+            'Source-reported hits (6) differ from returned candidate records (5); totals count returned records.',
+            'Some entries have no published member IID: detailAvailable is false and sourceRecordId is a distinct register UUID. Read their sourceUrl; do not pass the UUID to riksdag_get_member.',
+          ],
+        },
+      },
+    ];
+    for (const [index, { args, url, expected }] of cases.entries()) {
+      const result = await runToolContract(riksdagSearchMembers, args);
+      assertSuccess(result);
+      expect(String(network.mock.calls[index]?.[0])).toBe(url);
+      const { retrievedAt: _retrievedAt, ...rest } = result.structuredContent as Record<
+        string,
+        unknown
+      >;
+      expect(rest).toEqual(expected);
+      expect(domainText(result)).toEqual(
+        riksdagSearchMembers.output.parse(result.structuredContent),
+      );
+    }
+    expect(network).toHaveBeenCalledTimes(3);
+  });
+});
+const FIU_ROSTER = [
+  {
+    ...ROSTER_ITEMS[0],
+    committeeAssignments: [
+      rosterAssignment('Suppleant', '2026-10-06 11:00:00', '2030-10-01 10:59:00'),
+    ],
+  },
+  {
+    ...ROSTER_ITEMS[1],
+    committeeAssignments: [
+      rosterAssignment('Suppleant', '2026-10-06 11:00:00', '2030-10-01 10:59:00'),
+      rosterAssignment('Suppleant', '2026-10-06 11:00:00', '2030-10-01 10:59:00'),
+    ],
+  },
+  {
+    ...ROSTER_ITEMS[2],
+    committeeAssignments: [rosterAssignment('Extra suppleant', '2026-11-01', '2026-11-23')],
+  },
+  {
+    ...ROSTER_ITEMS[3],
+    committeeAssignments: [
+      rosterAssignment('Ordförande', '2026-10-06 11:31:00', '2030-09-23 10:59:00'),
+    ],
+  },
+];
+/** Answers each `personlista` URL as the source would for the synthetic FiU roster. */
+function rosterNetwork() {
+  return vi.fn<typeof fetch>().mockImplementation(async (url) => {
+    const query = new URL(String(url)).searchParams;
+    const organ = query.get('org');
+    const prefix = query.get('enamn');
+    const party = query.get('parti');
+    if (organ !== null && organ !== 'FiU') return Response.json(registerPayload([], 0));
+    const rows = rosterRows().filter(
+      (row) =>
+        (party === null || row.parti === party) &&
+        (prefix === null || row.sorteringsnamn.toLowerCase().startsWith(prefix.toLowerCase())),
+    );
+    const assignments = rows.reduce(
+      (total, row) =>
+        total +
+        row.personuppdrag.uppdrag.filter(
+          (entry) => entry.organ_kod === 'FiU' && entry.tom >= '2026-11-23',
+        ).length,
+      0,
+    );
+    return Response.json(registerPayload(rows, organ === null ? rows.length : assignments));
+  });
+}
+function text(result: Awaited<ReturnType<typeof runToolContract>>): string {
+  return result.content
+    .filter((block) => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n');
+}
+describe('committee rosters and family-name prefixes', () => {
+  it.each(['FiU', 'fiu', ' Finansutskottet ', 'Committee on Finance'])(
+    'resolves committee %s to org=FiU and returns each holder’s current FiU roles on both surfaces',
+    async (committee) => {
+      const network = rosterNetwork();
+      initRiksdagService({ fetch: network });
+      const result = await runToolContract(riksdagSearchMembers, { committee });
+      const enrichment = assertSuccess(result);
+      expect(network.mock.calls.map(([url]) => String(url))).toEqual([
+        'https://data.riksdagen.se/personlista/?org=FiU&rdlstatus=tjanst&utformat=json',
+      ]);
+      const page = riksdagSearchMembers.output.parse(result.structuredContent);
+      expect(page).toMatchObject({
+        items: FIU_ROSTER,
+        candidateCount: 4,
+        sourceReportedCount: 5,
+        totalCount: 4,
+        hasMore: false,
+      });
+      expect(domainText(result)).toEqual(page);
+      expect(text(result)).toContain('"committeeAssignments"');
+      expect(enrichment.effectiveQuery).toBe(
+        '{"committee":"FiU","limit":20,"offset":0,"register":"service","sitting":"all"}',
+      );
+      expect(enrichment.notices).toEqual([
+        SERVICE_NOTICE,
+        'Source-reported hits (5) count FiU assignments and differ from returned member records (4); totals count returned records.',
+      ]);
+    },
+  );
+  it.each([
+    ['fou', 'FöU'],
+    ['UFOU', 'UFöU'],
+  ])('resolves the ASCII committee spelling %s to org=%s', async (committee, code) => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () =>
+        Response.json(registerPayload(rosterRows(code.toUpperCase()), 5)),
+      );
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagSearchMembers, { committee });
+    const enrichment = assertSuccess(result);
+    expect(new URL(String(network.mock.calls[0]?.[0])).searchParams.get('org')).toBe(code);
+    expect(enrichment.effectiveQuery).toContain(`"committee":"${code}"`);
+    expect(result.structuredContent).toMatchObject({
+      items: [
+        { memberId: '0101', committeeAssignments: [{ organ: code.toUpperCase() }] },
+        { memberId: '0102' },
+        { memberId: '0103' },
+        { memberId: '0104' },
+      ],
+    });
+  });
+  it('sends committee with party upstream and returns the same roster from the all register', async () => {
+    const network = rosterNetwork();
+    initRiksdagService({ fetch: network });
+    const withParty = await runToolContract(riksdagSearchMembers, { committee: 'FiU', party: 's' });
+    const partyEnrichment = assertSuccess(withParty);
+    expect(withParty.structuredContent).toMatchObject({
+      items: [FIU_ROSTER[0], FIU_ROSTER[2]],
+      sourceReportedCount: 2,
+      totalCount: 2,
+    });
+    expect(partyEnrichment.notices).toEqual([SERVICE_NOTICE]);
+    const all = await runToolContract(riksdagSearchMembers, { committee: 'FiU', register: 'all' });
+    const allEnrichment = assertSuccess(all);
+    expect(all.structuredContent).toMatchObject({ items: FIU_ROSTER, totalCount: 4 });
+    expect(allEnrichment.notices).toContain(
+      'All-register scope covers returned source records, not an independently verified historical census.',
+    );
+    expect(allEnrichment.notices.join(' ')).not.toContain('normal timeout');
+    expect(network.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://data.riksdagen.se/personlista/?org=FiU&parti=S&rdlstatus=tjanst&utformat=json',
+      'https://data.riksdagen.se/personlista/?org=FiU&rdlstatus=samtliga&utformat=json',
+    ]);
+  });
+  it('narrows a roster with familyNamePrefix upstream and nameContains, constituency and sitting locally', async () => {
+    const network = rosterNetwork();
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagSearchMembers, {
+      committee: 'FiU',
+      familyNamePrefix: 'syn',
+      nameContains: 'cecilia',
+      constituency: 'Stockholms län',
+      sitting: 'serving',
+    });
+    assertSuccess(result);
+    expect(String(network.mock.calls[0]?.[0])).toBe(
+      'https://data.riksdagen.se/personlista/?enamn=syn&org=FiU&rdlstatus=tjanst&utformat=json',
+    );
+    expect(result.structuredContent).toMatchObject({
+      items: [FIU_ROSTER[2]],
+      candidateCount: 3,
+      totalCount: 1,
+    });
+    const narrowed = await runToolContract(riksdagSearchMembers, {
+      committee: 'FiU',
+      familyNamePrefix: 'syn',
+      sitting: 'not_serving',
+    });
+    expect(narrowed.structuredContent).toMatchObject({ items: [FIU_ROSTER[3]], totalCount: 1 });
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+  it('pages a roster with committee and familyNamePrefix in nextCall, then reaches offset past the end', async () => {
+    const network = rosterNetwork();
+    initRiksdagService({ fetch: network });
+    const first = await runToolContract(riksdagSearchMembers, { committee: 'fiu', limit: 2 });
+    assertSuccess(first);
+    const page = riksdagSearchMembers.output.parse(first.structuredContent);
+    expect(page.items).toEqual(FIU_ROSTER.slice(0, 2));
+    expect(page.nextCall).toEqual({
+      toolName: 'riksdag_search_members',
+      args: {
+        register: 'service',
+        committee: 'FiU',
+        sitting: 'all',
+        offset: 2,
+        limit: 2,
+        revision: page.revision,
+      },
+    });
+    const second = await runToolContract(
+      riksdagSearchMembers,
+      continuationArgs(riksdagSearchMembers, page.nextCall),
+    );
+    assertSuccess(second);
+    expect(second.structuredContent).toMatchObject({
+      items: FIU_ROSTER.slice(2),
+      revision: page.revision,
+      hasMore: false,
+    });
+    expect(domainText(second)).toEqual(riksdagSearchMembers.output.parse(second.structuredContent));
+    const past = await runToolContract(riksdagSearchMembers, { committee: 'FiU', offset: 99 });
+    assertSuccess(past);
+    expect(past.structuredContent).toMatchObject({ items: [], totalCount: 4, hasMore: false });
+    const clamped = await runToolContract(riksdagSearchMembers, { committee: 'FiU', limit: 101 });
+    expect(assertSuccess(clamped).notices).toContain('Requested limit was clamped to 100.');
+    expect(clamped.structuredContent).toMatchObject({ limit: 100, requestedLimit: 101 });
+    expect(network).toHaveBeenCalledTimes(1);
+    const prefixed = await runToolContract(riksdagSearchMembers, {
+      familyNamePrefix: 'Syn',
+      limit: 1,
+    });
+    expect(
+      riksdagSearchMembers.output.parse(prefixed.structuredContent).nextCall?.args,
+    ).toMatchObject({ familyNamePrefix: 'Syn', offset: 1 });
+  });
+  it('carries committee and familyNamePrefix in the revision', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => Response.json(registerPayload(rosterRows())));
+    initRiksdagService({ fetch: network });
+    const plain = riksdagSearchMembers.output.parse(
+      (await runToolContract(riksdagSearchMembers, { limit: 1 })).structuredContent,
+    );
+    const prefixed = riksdagSearchMembers.output.parse(
+      (await runToolContract(riksdagSearchMembers, { familyNamePrefix: 'Syn', limit: 1 }))
+        .structuredContent,
+    );
+    expect(prefixed.items).toEqual(plain.items);
+    expect(prefixed.revision).not.toBe(plain.revision);
+    const crossed = await runToolContract(riksdagSearchMembers, {
+      familyNamePrefix: 'Syn',
+      revision: plain.revision,
+    });
+    expect(crossed).toMatchObject({
+      isError: true,
+      structuredContent: { error: { data: { reason: 'revision_changed' } } },
+    });
+  });
+  it('keeps a holder with no current committee assignment with an empty list and a notice', async () => {
+    initRiksdagService({
+      fetch: async () =>
+        Response.json(registerPayload([...rosterRows(), rosterRowWithoutCurrentAssignment()], 5)),
+    });
+    const result = await runToolContract(riksdagSearchMembers, { committee: 'FiU' });
+    const enrichment = assertSuccess(result);
+    expect(result.structuredContent).toMatchObject({
+      items: [...FIU_ROSTER, { memberId: '0105', committeeAssignments: [] }],
+      sourceReportedCount: 5,
+      totalCount: 5,
+    });
+    expect(enrichment.notices).toEqual([
+      SERVICE_NOTICE,
+      `Some returned members hold no FiU assignment current at the source time (${SOURCE_TIME}); their committeeAssignments is empty.`,
+    ]);
+    expect(domainText(result)).toEqual(riksdagSearchMembers.output.parse(result.structuredContent));
+  });
+  it('fails upstream_identity_mismatch on both surfaces when a row lacks the committee', async () => {
+    initRiksdagService({
+      fetch: async () =>
+        Response.json(
+          registerPayload([
+            ...rosterRows(),
+            { intressent_id: '0109', personuppdrag: { uppdrag: { organ_kod: 'SkU' } } },
+          ]),
+        ),
+    });
+    const result = await runToolContract(riksdagSearchMembers, { committee: 'FiU' });
+    expect(result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: {
+          code: JsonRpcErrorCode.SerializationError,
+          data: {
+            reason: 'upstream_identity_mismatch',
+            recovery: { hint: expect.stringContaining('committee') },
+          },
+        },
+      },
+    });
+    expect(text(result)).toContain('committee');
+  });
+  it('reports a committee with no current holders', async () => {
+    const network = rosterNetwork();
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagSearchMembers, { committee: 'CKrU' });
+    const enrichment = assertSuccess(result);
+    expect(result.structuredContent).toMatchObject({ items: [], candidateCount: 0, totalCount: 0 });
+    expect(enrichment.notices).toContain(
+      'The source returned no current holders of CKrU for these filters; committee rosters cover current holders only.',
+    );
+    expect(enrichment.notices.join('\n')).not.toContain('local filters');
+    expect(String(network.mock.calls[0]?.[0])).toBe(
+      'https://data.riksdagen.se/personlista/?org=CKrU&rdlstatus=tjanst&utformat=json',
+    );
+  });
+  it('finds a historical family name from one enamn request and never sends fnamn', async () => {
+    const historical = {
+      intressent_id: HISTORICAL_UUID,
+      sourceid: HISTORICAL_UUID,
+      tilltalsnamn: 'Olof',
+      efternamn: 'Palme',
+      sorteringsnamn: 'Palme,Olof',
+      status: 'Tidigare riksdagsledamot',
+      person_url_xml: `https://data.riksdagen.se/person/${HISTORICAL_UUID}`,
+      personuppdrag: '',
+    };
+    const network = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+      const prefix = new URL(String(url)).searchParams.get('enamn');
+      return Response.json(registerPayload(prefix === 'Palme' ? [historical] : []));
+    });
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagSearchMembers, {
+      register: 'all',
+      familyNamePrefix: ' Palme ',
+    });
+    const enrichment = assertSuccess(result);
+    expect(result.structuredContent).toMatchObject({
+      items: [{ sourceRecordId: HISTORICAL_UUID, name: 'Olof Palme' }],
+      candidateCount: 1,
+      sourceReportedCount: 1,
+      totalCount: 1,
+    });
+    expect(enrichment.effectiveQuery).toBe(
+      '{"familyNamePrefix":"Palme","limit":20,"offset":0,"register":"all","sitting":"all"}',
+    );
+    expect(enrichment.notices).toContain(
+      'All-register scope covers returned source records, not an independently verified historical census.',
+    );
+    expect(domainText(result)).toEqual(riksdagSearchMembers.output.parse(result.structuredContent));
+    const missing = await runToolContract(riksdagSearchMembers, {
+      register: 'all',
+      familyNamePrefix: 'akesson',
+    });
+    const missingEnrichment = assertSuccess(missing);
+    expect(missing.structuredContent).toMatchObject({ items: [], candidateCount: 0 });
+    expect(missingEnrichment.notices).toContain(
+      'The source returned no records for this familyNamePrefix. Matching keeps accents (Åkesson, not akesson) and uses the sort name (Family,Given), which can drop particles such as von; nameContains with register all matches any part of a name.',
+    );
+    expect(missingEnrichment.notices.join('\n')).not.toContain('local filters');
+    const decomposed = await runToolContract(riksdagSearchMembers, {
+      register: 'all',
+      familyNamePrefix: 'Åkesson',
+      party: 'SD',
+    });
+    assertSuccess(decomposed);
+    const urls = network.mock.calls.map(([url]) => String(url));
+    expect(urls).toEqual([
+      'https://data.riksdagen.se/personlista/?enamn=Palme&rdlstatus=samtliga&utformat=json',
+      'https://data.riksdagen.se/personlista/?enamn=akesson&rdlstatus=samtliga&utformat=json',
+      'https://data.riksdagen.se/personlista/?enamn=%C3%85kesson&parti=SD&rdlstatus=samtliga&utformat=json',
+    ]);
+    for (const url of urls) expect(new URL(url).searchParams.has('fnamn')).toBe(false);
+  });
+  it('treats blank committee and familyNamePrefix as unset', async () => {
+    const network = rosterNetwork();
+    initRiksdagService({ fetch: network });
+    const result = await runToolContract(riksdagSearchMembers, {
+      committee: ' ',
+      familyNamePrefix: '',
+    });
+    assertSuccess(result);
+    expect(result.structuredContent).toMatchObject({ items: ROSTER_ITEMS });
+    expect(String(network.mock.calls[0]?.[0])).toBe(
+      'https://data.riksdagen.se/personlista/?rdlstatus=tjanst&utformat=json',
+    );
+  });
+});
 describe('member public contracts', () => {
   it('keeps all-register scope, substring filtering and source counts across cached continuations', async () => {
     const rows = [
@@ -607,12 +1147,8 @@ describe('member public contracts', () => {
           },
         },
       });
-      const text = result.content
-        .filter((block) => block.type === 'text')
-        .map((block) => block.text)
-        .join('\n');
-      expect(text).toContain('riksdag_search_members');
-      expect(text).toContain('party');
+      expect(text(result)).toContain('riksdag_search_members');
+      expect(text(result)).toContain('party');
     },
   );
   it('discloses requested and applied search limits and returns every heavy row whole', async () => {

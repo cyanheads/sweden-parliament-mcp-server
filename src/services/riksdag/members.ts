@@ -43,10 +43,25 @@ const memberWire = z.object({
 });
 const registerWire = z.object({
   personlista: z.object({
+    /** Source time; read only to select current committee assignments. */
+    '@systemdatum': s,
     '@hits': wireCount,
     person: collectionOf(memberWire),
   }),
 });
+type Register = z.infer<typeof registerWire>['personlista'];
+type AssignmentWire = z.infer<typeof assignmentWire>;
+
+/** Register request filters, each sent upstream. */
+export interface MemberFilters {
+  /** Committee code, sent as `org`; the source returns its current holders in either register. */
+  committee?: string | undefined;
+  /** Sort-name prefix, sent as `enamn`. */
+  familyNamePrefix?: string | undefined;
+  memberId?: string | undefined;
+  party?: string | undefined;
+  register?: 'service' | 'all' | undefined;
+}
 
 /** Sparse public register identity; contact properties and photographs are excluded. */
 export const memberSchema = z
@@ -120,12 +135,41 @@ function classification(status: string | undefined): 'serving' | 'not_serving' |
     return 'not_serving';
   return 'unknown';
 }
-function identityFailure(): never {
-  throw new McpError(
-    JsonRpcErrorCode.SerializationError,
-    'The member register contradicts the requested identity or party.',
-    { reason: 'upstream_identity_mismatch' },
+function identityFailure(
+  message = 'The member register contradicts the requested identity or party.',
+): never {
+  throw new McpError(JsonRpcErrorCode.SerializationError, message, {
+    reason: 'upstream_identity_mismatch',
+  });
+}
+
+/** `@systemdatum` and assignment bounds share one fixed-width form, so string order is time order. */
+const SOURCE_TIME = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+const ASSIGNMENT_BOUND = /^\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?$/;
+
+/** `personuppdrag` spells some organ codes in another case than `org` takes (`MJU`, `EUN`). */
+function inCommittee(assignment: AssignmentWire, committee: string): boolean {
+  return assignment.organ_kod?.toLowerCase() === committee.toLowerCase();
+}
+
+/** The interval contains the source time; a date-only end lasts through that day and an absent bound is open. */
+function currentAt({ from, tom }: AssignmentWire, sourceTime: string): boolean {
+  return (
+    (from === undefined || from <= sourceTime) &&
+    (tom === undefined || (tom.length === 10 ? tom >= sourceTime.slice(0, 10) : tom >= sourceTime))
   );
+}
+
+function assignmentOf(assignment: AssignmentWire): z.infer<typeof assignmentSchema> {
+  return {
+    organ: assignment.organ_kod,
+    role: assignment.roll_kod,
+    status: assignment.status,
+    type: assignment.typ,
+    from: assignment.from,
+    to: assignment.tom,
+    descriptions: assignment.uppgift,
+  };
 }
 function metadata(row: z.infer<typeof memberWire>): z.infer<typeof memberSchema> {
   const names = [row.tilltalsnamn, row.efternamn].filter((name) => name !== undefined);
@@ -151,14 +195,17 @@ function metadata(row: z.infer<typeof memberWire>): z.infer<typeof memberSchema>
         : `https://data.riksdagen.se/personlista/?iid=${row.intressent_id}&rdlstatus=tjanst&utformat=json`,
   };
 }
-function validate(
-  root: z.infer<typeof registerWire>['personlista'],
-  party?: string,
-  memberId?: string,
-  register: 'service' | 'all' = 'service',
-): void {
-  if (register === 'service' && root['@hits'] !== root.person.length)
+/** A committee response's `@hits` counts assignments, not people, so only plain service lists are count-checked. */
+function validate(root: Register, filters: MemberFilters): void {
+  const { committee, memberId, party } = filters;
+  if (filters.register !== 'all' && committee === undefined && root['@hits'] !== root.person.length)
     throw schemaInvalid('Member register hit count contradicts its returned rows.');
+  if (
+    committee !== undefined &&
+    root.person.length > 0 &&
+    !SOURCE_TIME.test(root['@systemdatum'] ?? '')
+  )
+    throw schemaInvalid('Committee roster lacks a valid source time.');
   if (root.person.length >= 50_000)
     throw new McpError(
       JsonRpcErrorCode.ValidationError,
@@ -191,19 +238,37 @@ function validate(
     )
       identityFailure();
     metadata(row);
-    for (const assignment of row.personuppdrag?.uppdrag ?? [])
+    const assignments = row.personuppdrag?.uppdrag ?? [];
+    for (const assignment of assignments)
       if (assignment.intressent_id !== undefined && assignment.intressent_id !== row.intressent_id)
         identityFailure();
+    if (committee === undefined) continue;
+    const held = assignments.filter((assignment) => inCommittee(assignment, committee));
+    if (!held.length)
+      identityFailure(
+        'The member register returned a row with no assignment in the requested committee.',
+      );
+    for (const { from, tom } of held)
+      if (
+        (from !== undefined && !ASSIGNMENT_BOUND.test(from)) ||
+        (tom !== undefined && !ASSIGNMENT_BOUND.test(tom))
+      )
+        throw schemaInvalid('Committee assignment bound is not a source date or timestamp.');
   }
   if (memberId !== undefined && root.person.length > 1) identityFailure();
 }
 
-/** Fetches the selected register; source-reported hits remain distinct from returned rows. */
+/**
+ * Fetches the selected register; source-reported hits remain distinct from returned rows. With
+ * `committee`, each record also carries its assignments in that committee current at the
+ * response's source time.
+ */
 export async function loadMembers(
   service: RiksdagService,
   budget: ToolBudget,
-  filters: { party?: string; memberId?: string; register?: 'service' | 'all' } = {},
+  filters: MemberFilters = {},
 ) {
+  const { committee } = filters;
   const loaded = await service.loadJson(
     {
       path: '/personlista/',
@@ -212,11 +277,13 @@ export async function loadMembers(
         utformat: 'json',
         parti: filters.party,
         iid: filters.memberId,
+        org: committee,
+        enamn: filters.familyNamePrefix,
       },
       schema: registerWire,
       ttlMs: 300000,
       cacheable: (data) => {
-        validate(data.personlista, filters.party, filters.memberId, filters.register);
+        validate(data.personlista, filters);
         return data.personlista.person.length > 0;
       },
     },
@@ -224,23 +291,32 @@ export async function loadMembers(
   );
   if (!loaded.found)
     throw schemaInvalid('Member register unexpectedly returned a missing HTTP response.');
-  validate(loaded.data.personlista, filters.party, filters.memberId, filters.register);
-  const records = loaded.data.personlista.person.map((row) => ({
-    ...metadata(row),
-    assignments: (row.personuppdrag?.uppdrag ?? []).map((assignment) => ({
-      organ: assignment.organ_kod,
-      role: assignment.roll_kod,
-      status: assignment.status,
-      type: assignment.typ,
-      from: assignment.from,
-      to: assignment.tom,
-      descriptions: assignment.uppgift,
-    })),
-  }));
+  const register = loaded.data.personlista;
+  validate(register, filters);
+  const sourceTime = register['@systemdatum'];
+  const records = register.person.map((row) => {
+    const assignments = row.personuppdrag?.uppdrag ?? [];
+    return {
+      ...metadata(row),
+      assignments: assignments.map(assignmentOf),
+      // validate() requires a source time on every committee response that has rows.
+      ...(committee === undefined || sourceTime === undefined
+        ? {}
+        : {
+            committeeAssignments: assignments
+              .filter(
+                (assignment) =>
+                  inCommittee(assignment, committee) && currentAt(assignment, sourceTime),
+              )
+              .map(assignmentOf),
+          }),
+    };
+  });
   budget.check();
   return {
     records,
-    sourceReportedCount: loaded.data.personlista['@hits'],
+    sourceReportedCount: register['@hits'],
+    sourceTime,
     retrievedAt: loaded.retrievedAt,
   };
 }

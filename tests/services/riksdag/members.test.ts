@@ -3,7 +3,229 @@ import { describe, expect, it, vi } from 'vitest';
 import { loadMembers } from '@/services/riksdag/members.js';
 import { RiksdagService } from '@/services/riksdag/riksdag-service.js';
 import { createToolBudget } from '@/services/riksdag/transport.js';
-import { memberDetail } from './member-fixtures.js';
+import {
+  memberDetail,
+  registerPayload,
+  rosterAssignment,
+  rosterRows,
+  rosterRowWithoutCurrentAssignment,
+  SOURCE_TIME,
+} from './member-fixtures.js';
+
+describe('member register committee and family-name filters', () => {
+  it('sends committee as org and familyNamePrefix as enamn, never fnamn', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => Response.json(registerPayload([rosterRows()[0]], 1)));
+    const service = new RiksdagService({ fetch: network });
+    using budget = createToolBudget();
+    try {
+      await loadMembers(service, budget, { committee: 'FiU', familyNamePrefix: 'Pal', party: 'S' });
+      await loadMembers(service, budget, { familyNamePrefix: 'Palme', register: 'all' });
+      expect(network.mock.calls.map(([url]) => String(url))).toEqual([
+        'https://data.riksdagen.se/personlista/?enamn=Pal&org=FiU&parti=S&rdlstatus=tjanst&utformat=json',
+        'https://data.riksdagen.se/personlista/?enamn=Palme&rdlstatus=samtliga&utformat=json',
+      ]);
+    } finally {
+      service.dispose();
+    }
+  });
+  it('returns assignment-counted committee hits as sourceReportedCount instead of failing', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => Response.json(registerPayload(rosterRows('EUN'), 5)));
+    const service = new RiksdagService({ fetch: network });
+    using budget = createToolBudget();
+    try {
+      const result = await loadMembers(service, budget, { committee: 'eun' });
+      expect(result).toMatchObject({ sourceReportedCount: 5, sourceTime: SOURCE_TIME });
+      expect(result.records).toHaveLength(4);
+      await loadMembers(service, budget, { committee: 'eun' });
+      expect(network).toHaveBeenCalledTimes(1);
+    } finally {
+      service.dispose();
+    }
+  });
+  it('keeps the strict service-register count for a family-name prefix', async () => {
+    const network = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => Response.json(registerPayload(rosterRows(), 5)));
+    const service = new RiksdagService({ fetch: network });
+    using budget = createToolBudget();
+    try {
+      for (let i = 0; i < 2; i++)
+        await expect(
+          loadMembers(service, budget, { familyNamePrefix: 'Syn' }),
+        ).rejects.toMatchObject({ data: { reason: 'upstream_schema_invalid' } });
+      expect(network).toHaveBeenCalledTimes(2);
+    } finally {
+      service.dispose();
+    }
+  });
+  it('selects each row’s assignments in the committee current at the source time, as published', async () => {
+    const service = new RiksdagService({
+      fetch: async () =>
+        Response.json(
+          registerPayload([...rosterRows('EUN'), rosterRowWithoutCurrentAssignment('EUN')]),
+        ),
+    });
+    using budget = createToolBudget();
+    try {
+      const result = await loadMembers(service, budget, { committee: 'eun' });
+      expect(
+        result.records.map(({ memberId, committeeAssignments }) => ({
+          memberId,
+          committeeAssignments,
+        })),
+      ).toEqual([
+        {
+          memberId: '0101',
+          committeeAssignments: [
+            rosterAssignment('Suppleant', '2026-10-06 11:00:00', '2030-10-01 10:59:00', 'EUN'),
+          ],
+        },
+        {
+          memberId: '0102',
+          committeeAssignments: [
+            rosterAssignment('Suppleant', '2026-10-06 11:00:00', '2030-10-01 10:59:00', 'EUN'),
+            rosterAssignment('Suppleant', '2026-10-06 11:00:00', '2030-10-01 10:59:00', 'EUN'),
+          ],
+        },
+        {
+          memberId: '0103',
+          committeeAssignments: [
+            rosterAssignment('Extra suppleant', '2026-11-01', '2026-11-23', 'EUN'),
+          ],
+        },
+        {
+          memberId: '0104',
+          committeeAssignments: [
+            rosterAssignment('Ordförande', '2026-10-06 11:31:00', '2030-09-23 10:59:00', 'EUN'),
+          ],
+        },
+        { memberId: '0105', committeeAssignments: [] },
+      ]);
+      expect(result.records[0]?.assignments).toHaveLength(3);
+    } finally {
+      service.dispose();
+    }
+  });
+  it.each([
+    ['2026-11-23', '2026-11-23', true],
+    ['2026-11-23 15:53:11', '2026-11-23 15:53:11', true],
+    ['2026-11-23 16:00:00', '2030-01-01', false],
+    ['2020-01-01', '2026-11-23 15:53:10', false],
+    ['2020-01-01', '2026-11-22', false],
+    ['2026-11-24', undefined, false],
+    [undefined, '2026-11-24', true],
+    [undefined, undefined, true],
+  ])('treats an assignment from %s to %s as current: %s', async (from, tom, current) => {
+    const assignment = { organ_kod: 'FIU', roll_kod: 'Ledamot', typ: 'uppdrag', from, tom };
+    const service = new RiksdagService({
+      fetch: async () =>
+        Response.json(
+          registerPayload([{ intressent_id: '0001', personuppdrag: { uppdrag: assignment } }]),
+        ),
+    });
+    using budget = createToolBudget();
+    try {
+      const result = await loadMembers(service, budget, { committee: 'FiU' });
+      expect(result.records[0]?.committeeAssignments).toEqual(
+        current
+          ? [{ organ: 'FIU', role: 'Ledamot', type: 'uppdrag', from, to: tom, descriptions: [] }]
+          : [],
+      );
+    } finally {
+      service.dispose();
+    }
+  });
+  it.each([
+    ['a row without the committee', 'upstream_identity_mismatch'],
+    ['no source time', 'upstream_schema_invalid'],
+    ['a malformed source time', 'upstream_schema_invalid'],
+    ['a malformed committee bound', 'upstream_schema_invalid'],
+  ])('rejects a committee response with %s and does not cache it', async (kind, reason) => {
+    const rows: unknown[] = rosterRows();
+    const payload: { personlista: Record<string, unknown> } = registerPayload(rows, 5);
+    if (kind === 'a row without the committee')
+      rows.push({ intressent_id: '0109', personuppdrag: { uppdrag: { organ_kod: 'SkU' } } });
+    if (kind === 'no source time') delete payload.personlista['@systemdatum'];
+    if (kind === 'a malformed source time') payload.personlista['@systemdatum'] = '23/11/2026';
+    if (kind === 'a malformed committee bound')
+      rows.push({
+        intressent_id: '0109',
+        personuppdrag: { uppdrag: { organ_kod: 'FiU', from: '2026-11-01T10:00:00' } },
+      });
+    payload.personlista['@hits'] = String(rows.length);
+    const network = vi.fn<typeof fetch>().mockImplementation(async () => Response.json(payload));
+    const service = new RiksdagService({ fetch: network });
+    using budget = createToolBudget();
+    try {
+      for (let i = 0; i < 2; i++)
+        await expect(loadMembers(service, budget, { committee: 'FiU' })).rejects.toMatchObject({
+          data: { reason },
+        });
+      expect(network).toHaveBeenCalledTimes(2);
+    } finally {
+      service.dispose();
+    }
+  });
+  it.each(['2026-11-30T00:00:00', '30/11/2026'])(
+    'rejects a committee assignment ending %s and does not cache the response',
+    async (tom) => {
+      const rows = [
+        ...rosterRows(),
+        {
+          intressent_id: '0109',
+          personuppdrag: { uppdrag: { organ_kod: 'FiU', from: '2026-11-01', tom } },
+        },
+      ];
+      const network = vi
+        .fn<typeof fetch>()
+        .mockImplementation(async () => Response.json(registerPayload(rows)));
+      const service = new RiksdagService({ fetch: network });
+      using budget = createToolBudget();
+      try {
+        for (let i = 0; i < 2; i++)
+          await expect(loadMembers(service, budget, { committee: 'FiU' })).rejects.toMatchObject({
+            data: { reason: 'upstream_schema_invalid' },
+          });
+        expect(network).toHaveBeenCalledTimes(2);
+      } finally {
+        service.dispose();
+      }
+    },
+  );
+  it('reads source time and committee bounds only for committee requests', async () => {
+    const person = {
+      intressent_id: '0001',
+      personuppdrag: { uppdrag: [{ organ_kod: 'kam', from: 'okänt' }, { organ_kod: 'FiU' }] },
+    };
+    const service = new RiksdagService({
+      fetch: async () =>
+        Response.json({ personlista: { '@systemdatum': 'okänt', '@hits': '1', person } }),
+    });
+    using budget = createToolBudget();
+    try {
+      const plain = await loadMembers(service, budget);
+      expect(plain.records[0]).not.toHaveProperty('committeeAssignments');
+      expect(plain.records[0]?.assignments).toHaveLength(2);
+      const empty = new RiksdagService({
+        fetch: async () => Response.json({ personlista: { '@hits': '0' } }),
+      });
+      try {
+        await expect(loadMembers(empty, budget, { committee: 'CKrU' })).resolves.toMatchObject({
+          records: [],
+          sourceReportedCount: 0,
+        });
+      } finally {
+        empty.dispose();
+      }
+    } finally {
+      service.dispose();
+    }
+  });
+});
 
 describe('member register endpoint', () => {
   it('leaves an oversized all-register response uncached under the existing bound', async () => {

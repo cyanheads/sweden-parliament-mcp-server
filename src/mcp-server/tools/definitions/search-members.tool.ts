@@ -1,7 +1,7 @@
-/** @fileoverview Complete-register member discovery with local filters. @module mcp-server/tools/definitions/search-members.tool */
+/** @fileoverview Member-register discovery: party, committee and family-name prefix upstream, name, constituency and service locally. @module mcp-server/tools/definitions/search-members.tool */
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { loadMembers, memberSchema } from '../../../services/riksdag/members.js';
+import { assignmentSchema, loadMembers, memberSchema } from '../../../services/riksdag/members.js';
 import {
   matchesAllTokens,
   normalizeCode,
@@ -25,13 +25,25 @@ const argsSchema = z.object({
     .enum(['service', 'all'])
     .default('service')
     .describe(
-      'Register scope; all includes historical records, and a cold request can reach the normal timeout.',
+      'Register scope; all includes historical records, and a cold request without committee or familyNamePrefix can reach the normal timeout.',
     ),
   nameContains: z
     .string()
     .optional()
     .describe('Strict all-token local name filter, ignoring case and diacritics.'),
+  familyNamePrefix: z
+    .string()
+    .optional()
+    .describe(
+      'Family-name prefix matched by the source in either register: the start of its sort name (Family,Given, so von Sydow sorts as Sydow), ignoring case but not accents, with V and W treated alike. Cannot contain %, _ or a comma.',
+    ),
   party: z.string().optional().describe('Party code or exact reference label.'),
+  committee: z
+    .string()
+    .optional()
+    .describe(
+      'Committee code or exact reference label; returns its current holders in either register, each with committeeAssignments current at the source time.',
+    ),
   constituency: z
     .string()
     .optional()
@@ -48,11 +60,24 @@ const argsSchema = z.object({
 export const riksdagSearchMembers = tool('riksdag_search_members', {
   title: 'Search parliamentary members',
   description:
-    'Find members and ministers by name, party, constituency and service status. Defaults to the service register; register all includes earlier source records through a larger cold request that may time out. Use numeric memberId with riksdag_get_member for assignment history.',
+    'Find members and ministers by name, family-name prefix, party, committee, constituency and service status. Defaults to the service register; register all includes earlier source records through a larger cold request that may time out unless committee or familyNamePrefix narrows it. A committee returns its current holders with their current roles. Use numeric memberId with riksdag_get_member for assignment history.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: argsSchema,
   output: z.object({
-    items: z.array(memberSchema).describe('Filtered member-register rows.'),
+    items: z
+      .array(
+        memberSchema
+          .extend({
+            committeeAssignments: z
+              .array(assignmentSchema)
+              .optional()
+              .describe(
+                'Assignments in the requested committee whose interval contains the source time, in source order; a date-only end counts through that day. Present only with committee.',
+              ),
+          })
+          .describe('Public member register metadata.'),
+      )
+      .describe('Filtered member-register rows.'),
     candidateCount: z
       .number()
       .describe('Returned candidate records in the selected register scope.'),
@@ -74,7 +99,7 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Unknown party or constituency code, or punctuation-only nameContains.',
+      when: 'Unknown party, committee or constituency code, punctuation-only nameContains, or a familyNamePrefix containing %, _ or a comma.',
       recovery:
         'Use riksdag_list_reference to check codes and identifier formats, then retry the same tool with corrected filters.',
       thrownBy: 'service',
@@ -92,7 +117,7 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
       code: JsonRpcErrorCode.SerializationError,
       when: 'Source rows contradict the required identity.',
       recovery:
-        'Check party and constituency with riksdag_list_reference and retry riksdag_search_members; report repeated mismatches with the request identifier.',
+        'Check party, committee and constituency with riksdag_list_reference and retry riksdag_search_members; report repeated mismatches with the request identifier.',
       thrownBy: 'service',
     },
     {
@@ -130,13 +155,27 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
     using budget = createToolBudget(ctx.signal);
     const name = optionalString(input.nameContains),
       partyInput = optionalString(input.party),
-      constituencyInput = optionalString(input.constituency);
+      committeeInput = optionalString(input.committee),
+      constituencyInput = optionalString(input.constituency),
+      familyNamePrefix = optionalString(input.familyNamePrefix)?.normalize('NFC');
+    // The source reads % and _ as wildcards and a comma as the start of the given name.
+    if (familyNamePrefix !== undefined && /[%_,]/.test(familyNamePrefix))
+      throw ctx.fail('invalid_filter', 'familyNamePrefix cannot contain %, _ or a comma.', {
+        field: 'familyNamePrefix',
+        recovery: {
+          hint: 'Retry riksdag_search_members with familyNamePrefix set to the leading letters of the family name only, or use nameContains to match any part of a name.',
+        },
+      });
     const filters = {
       register: input.register,
+      committee: committeeInput
+        ? normalizeCode(committeeInput, 'committees', 'committee')
+        : undefined,
+      familyNamePrefix,
       nameContains: name,
-      party: partyInput ? normalizeCode(partyInput, 'parties') : undefined,
+      party: partyInput ? normalizeCode(partyInput, 'parties', 'party') : undefined,
       constituency: constituencyInput
-        ? normalizeCode(constituencyInput, 'constituencies')
+        ? normalizeCode(constituencyInput, 'constituencies', 'constituency')
         : undefined,
       sitting: input.sitting,
       offset: input.offset,
@@ -145,14 +184,21 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
     const tokens = name ? normalizeTokens(name) : [];
     const loaded = await loadMembers(getRiksdagService(), budget, {
       register: filters.register,
-      ...(filters.party === undefined ? {} : { party: filters.party }),
+      party: filters.party,
+      committee: filters.committee,
+      familyNamePrefix: filters.familyNamePrefix,
     });
     const candidates = loaded.records
       .map(({ assignments: _assignments, ...member }) => member)
       .sort((a, b) =>
         (a.memberId ?? a.sourceRecordId ?? '').localeCompare(b.memberId ?? b.sourceRecordId ?? ''),
       );
-    const revision = await revisionOf({ register: filters.register, candidates });
+    const revision = await revisionOf({
+      register: filters.register,
+      committee: filters.committee,
+      familyNamePrefix: filters.familyNamePrefix,
+      candidates,
+    });
     assertRevision(optionalString(input.revision), revision);
     const rows = candidates.filter(
       (member) =>
@@ -169,20 +215,42 @@ export const riksdagSearchMembers = tool('riksdag_search_members', {
       ],
     };
     if (input.limit > 100) enrichment.notices.push('Requested limit was clamped to 100.');
-    if (filters.register === 'all') {
+    if (filters.register === 'all')
       enrichment.notices.push(
-        'All-register scope covers returned source records, not an independently verified historical census. Cold requests can reach the normal timeout.',
+        filters.committee !== undefined || filters.familyNamePrefix !== undefined
+          ? 'All-register scope covers returned source records, not an independently verified historical census.'
+          : 'All-register scope covers returned source records, not an independently verified historical census. Cold requests can reach the normal timeout.',
       );
-      if (loaded.sourceReportedCount !== candidates.length)
+    // A plain service-register response fails loading unless its hits equal its rows.
+    if (loaded.sourceReportedCount !== candidates.length)
+      enrichment.notices.push(
+        filters.committee === undefined
+          ? `Source-reported hits (${loaded.sourceReportedCount}) differ from returned candidate records (${candidates.length}); totals count returned records.`
+          : `Source-reported hits (${loaded.sourceReportedCount}) count ${filters.committee} assignments and differ from returned member records (${candidates.length}); totals count returned records.`,
+      );
+    if (filters.committee !== undefined) {
+      if (rows.some((member) => member.committeeAssignments?.length === 0))
         enrichment.notices.push(
-          `Source-reported hits (${loaded.sourceReportedCount}) differ from returned candidate records (${candidates.length}); totals count returned records.`,
+          `Some returned members hold no ${filters.committee} assignment current at the source time (${loaded.sourceTime}); their committeeAssignments is empty.`,
+        );
+      if (!candidates.length)
+        enrichment.notices.push(
+          `The source returned no current holders of ${filters.committee} for these filters; committee rosters cover current holders only.`,
         );
     }
+    if (filters.familyNamePrefix !== undefined && !candidates.length)
+      enrichment.notices.push(
+        'The source returned no records for this familyNamePrefix. Matching keeps accents (Åkesson, not akesson) and uses the sort name (Family,Given), which can drop particles such as von; nameContains with register all matches any part of a name.',
+      );
     if (rows.some((member) => !member.detailAvailable))
       enrichment.notices.push(
         'Some entries have no published member IID: detailAvailable is false and sourceRecordId is a distinct register UUID. Read their sourceUrl; do not pass the UUID to riksdag_get_member.',
       );
-    if (!rows.length)
+    // An empty committee or family-name response is explained above; no local filter ran.
+    const sourceEmptyExplained =
+      !candidates.length &&
+      (filters.committee !== undefined || filters.familyNamePrefix !== undefined);
+    if (!rows.length && !sourceEmptyExplained)
       enrichment.notices.push(
         'No register entries matched these local filters. Retry riksdag_search_members with sitting all or fewer name tokens; use riksdag_list_reference for party and constituency codes.',
       );
