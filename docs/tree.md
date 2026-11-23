@@ -1,6 +1,6 @@
 # sweden-parliament-mcp-server - Directory Structure
 
-Generated on: 2026-11-16 02:45:11
+Generated on: 2026-11-23 16:25:27
 
 ```text
 sweden-parliament-mcp-server/
@@ -203,6 +203,7 @@ sweden-parliament-mcp-server/
 │   │       ├── speech-fixtures.ts
 │   │       ├── speeches.test.ts
 │   │       ├── text-output.test.ts
+│   │       ├── text-timing.test.ts
 │   │       ├── transport-service.test.ts
 │   │       ├── upstream-boundaries.test.ts
 │   │       ├── vote-fixtures.ts
